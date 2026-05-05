@@ -18,6 +18,7 @@ pub struct Daemon {
     current_window: Option<String>,
     current_session: Option<Session>,
     last_input: Arc<Mutex<DateTime<Local>>>,
+    last_recorded_idle_secs: i64,
 }
 
 impl Daemon {
@@ -35,6 +36,7 @@ impl Daemon {
             current_window: None,
             current_session: None,
             last_input,
+            last_recorded_idle_secs: 0,
         }
     }
 
@@ -83,11 +85,36 @@ impl Daemon {
                 break;
             }
 
-            // Check for AFK status every second
+            // Check for AFK status and window changes every second
             if last_afk_check.elapsed() >= afk_check_interval {
+                // Get current window info to detect activity even if rdev fails (Wayland fallback)
+                let active_info = self.monitor.get_active_window_info_async().await.ok();
+
+                if let Some((ref active_app, ref active_window)) = active_info {
+                    if active_app != &self.current_app || active_window != &self.current_window {
+                        // Window changed -> User is active
+                        if self.current_app != "AFK" {
+                            log::info!("Activity detected via window change: '{}' -> '{}'", self.current_app, active_app);
+                        }
+                        *self.last_input.lock().unwrap() = Local::now();
+                    }
+                }
+
                 let idle_duration = Local::now().signed_duration_since(*self.last_input.lock().unwrap());
                 let is_currently_afk = idle_duration.num_seconds() >= afk_threshold.as_secs() as i64;
                 let is_currently_idle = idle_duration.num_seconds() >= idle_threshold.as_secs() as i64;
+
+                // Accumulate idle time in current session
+                if let Some(ref mut session) = self.current_session {
+                    let current_idle_secs = idle_duration.num_seconds();
+                    // Only accumulate if idle time increased and we're not in full IDLE gap
+                    if current_idle_secs > self.last_recorded_idle_secs && current_idle_secs < 600 && !session.is_idle.unwrap_or(false) {
+                        let idle_delta = current_idle_secs - self.last_recorded_idle_secs;
+                        let accumulated_before = session.idle_accumulation_secs.unwrap_or(0);
+                        session.idle_accumulation_secs = Some(accumulated_before + idle_delta);
+                    }
+                    self.last_recorded_idle_secs = current_idle_secs;
+                }
 
                 // If we have a current session, check if AFK state changed
                 if let Some(ref mut session) = self.current_session {
@@ -118,7 +145,13 @@ impl Daemon {
                             log::warn!("Failed to apply renames and categories on AFK change: {}", e);
                         }
 
-                        if let Err(e) = self.database.insert_session(&old_session).await {
+                        let save_result = if let Some(_id) = old_session.id {
+                            self.database.update_session(&old_session).await
+                        } else {
+                            self.database.insert_session(&old_session).await.map(|_| ())
+                        };
+
+                        if let Err(e) = save_result {
                             log::error!("Failed to save session on AFK state change: {}", e);
                         } else {
                             log::info!("Session saved on AFK state change: {} -> is_afk={}", old_session.app_name, is_currently_afk);
@@ -132,14 +165,23 @@ impl Daemon {
                                 new_session.is_afk = Some(true);
                             }
                         } else {
-                            // Returning from AFK - get the actual active app
-                            if let Ok((active_app, active_window)) = self.monitor.get_active_window_info_async().await {
-                                self.switch_app(active_app.clone(), active_window.clone()).await?;
-                                if let Some(ref mut new_session) = self.current_session {
-                                    new_session.is_afk = Some(false);
-                                }
+                            // Returning from AFK - use detected info or fallback to monitor
+                            let (app, win) = if let Some(info) = active_info {
+                                info
+                            } else if let Ok(info) = self.monitor.get_active_window_info_async().await {
+                                info
+                            } else {
+                                ("unknown".to_string(), None)
+                            };
+                            
+                            self.switch_app(app, win).await?;
+                            if let Some(ref mut new_session) = self.current_session {
+                                new_session.is_afk = Some(false);
                             }
                         }
+
+                        // Reset idle tracking for new session
+                        self.last_recorded_idle_secs = 0;
                     }
                 }
 
@@ -151,8 +193,6 @@ impl Daemon {
                 let idle_duration = Local::now().signed_duration_since(*self.last_input.lock().unwrap());
                 let is_currently_afk = idle_duration.num_seconds() >= afk_threshold.as_secs() as i64;
 
-                log::debug!("Detected active app: '{}', window: '{:?}'", active_app, active_window);
-
                 // Only track app changes if not AFK
                 if !is_currently_afk {
                     // Check if app or window changed
@@ -161,15 +201,18 @@ impl Daemon {
                                   self.current_app, active_app, self.current_window, active_window);
                         self.switch_app(active_app.clone(), active_window.clone()).await?;
 
+                        // Reset idle tracking for new session
+                        self.last_recorded_idle_secs = 0;
+
                         // Mark new session as not AFK
                         if let Some(ref mut session) = self.current_session {
                             session.is_afk = Some(false);
                         }
-                    }
 
-                    // Always update current state after successful detection
-                    self.current_app = active_app;
-                    self.current_window = active_window;
+                        // Always update current state after successful detection
+                        self.current_app = active_app;
+                        self.current_window = active_window;
+                    }
                 }
             }
 
@@ -180,7 +223,20 @@ impl Daemon {
                     if let Err(e) = self.database.apply_renames_and_categories(session).await {
                         log::warn!("Failed to apply renames and categories on auto-save: {}", e);
                     }
-                    if let Err(e) = self.database.insert_session(session).await {
+                    
+                    let save_result = if let Some(_id) = session.id {
+                        self.database.update_session(session).await
+                    } else {
+                        match self.database.insert_session(session).await {
+                            Ok(id) => {
+                                session.id = Some(id);
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
+                        }
+                    };
+
+                    if let Err(e) = save_result {
                         log::error!("Failed to auto save session: {}", e);
                     } else {
                         last_save = tokio::time::Instant::now();
@@ -198,7 +254,14 @@ impl Daemon {
             if let Err(e) = self.database.apply_renames_and_categories(&mut session).await {
                 log::warn!("Failed to apply renames and categories on exit: {}", e);
             }
-            if let Err(e) = self.database.insert_session(&session).await {
+            
+            let save_result = if let Some(_id) = session.id {
+                self.database.update_session(&session).await
+            } else {
+                self.database.insert_session(&session).await.map(|_| ())
+            };
+
+            if let Err(e) = save_result {
                 log::error!("Failed to save session on exit: {}", e);
             } else {
                 log::info!("Saved session on exit: {} for {}s", session.app_name, session.duration);
@@ -246,7 +309,13 @@ impl Daemon {
         if let Some(mut session) = self.current_session.take() {
             session.duration = Local::now().signed_duration_since(session.start_time).num_seconds();
 
-            if let Err(e) = self.database.insert_session(&session).await {
+            let save_result = if let Some(_id) = session.id {
+                self.database.update_session(&session).await
+            } else {
+                self.database.insert_session(&session).await.map(|_| ())
+            };
+
+            if let Err(e) = save_result {
                 log::error!("Failed to save session: {}", e);
             } else {
                 log::info!("Saved session: {} for {}s", session.app_name, session.duration);

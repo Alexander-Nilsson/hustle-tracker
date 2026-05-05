@@ -203,6 +203,65 @@ impl Database {
         Ok(id.0)
     }
 
+    pub async fn update_session(&self, session: &Session) -> Result<()> {
+        let id = session.id.ok_or_else(|| anyhow::anyhow!("Cannot update session without ID"))?;
+        sqlx::query(
+            r#"
+            UPDATE sessions SET
+                app_name = $1, window_name = $2, duration = $3, category = $4,
+                browser_url = $5, browser_page_title = $6, browser_notification_count = $7,
+                browser_page_title_renamed = $8, browser_page_title_category = $9,
+                terminal_username = $10, terminal_hostname = $11, terminal_directory = $12, terminal_project_name = $13,
+                terminal_directory_renamed = $14, terminal_directory_category = $15,
+                editor_filename = $16, editor_filepath = $17, editor_project_path = $18, editor_language = $19,
+                editor_filename_renamed = $20, editor_filename_category = $21,
+                tmux_window_name = $22, tmux_pane_count = $23, terminal_multiplexer = $24,
+                tmux_window_name_renamed = $25, tmux_window_name_category = $26,
+                ide_project_name = $27, ide_file_open = $28, ide_workspace = $29,
+                parsed_data = $30, parsing_success = $31, is_afk = $32, is_idle = $33, idle_accumulation_secs = $34
+            WHERE id = $35
+            "#,
+        )
+        .bind(&session.app_name)
+        .bind(&session.window_name)
+        .bind(session.duration)
+        .bind(&session.category)
+        .bind(&session.browser_url)
+        .bind(&session.browser_page_title)
+        .bind(session.browser_notification_count)
+        .bind(&session.browser_page_title_renamed)
+        .bind(&session.browser_page_title_category)
+        .bind(&session.terminal_username)
+        .bind(&session.terminal_hostname)
+        .bind(&session.terminal_directory)
+        .bind(&session.terminal_project_name)
+        .bind(&session.terminal_directory_renamed)
+        .bind(&session.terminal_directory_category)
+        .bind(&session.editor_filename)
+        .bind(&session.editor_filepath)
+        .bind(&session.editor_project_path)
+        .bind(&session.editor_language)
+        .bind(&session.editor_filename_renamed)
+        .bind(&session.editor_filename_category)
+        .bind(&session.tmux_window_name)
+        .bind(session.tmux_pane_count)
+        .bind(&session.terminal_multiplexer)
+        .bind(&session.tmux_window_name_renamed)
+        .bind(&session.tmux_window_name_category)
+        .bind(&session.ide_project_name)
+        .bind(&session.ide_file_open)
+        .bind(&session.ide_workspace)
+        .bind(&session.parsed_data)
+        .bind(session.parsing_success)
+        .bind(session.is_afk)
+        .bind(session.is_idle)
+        .bind(session.idle_accumulation_secs)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn get_recent_sessions(&self, limit: i64) -> Result<Vec<Session>> {
         let sessions = sqlx::query_as::<_, Session>(
             r#"

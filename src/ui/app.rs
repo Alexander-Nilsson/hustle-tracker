@@ -148,156 +148,52 @@ impl App {
                         // If idle time is very low, consider it as recent activity
                         if idle_seconds < 3 {
                             *last_input.lock().unwrap() = Local::now();
-                            log::debug!("Updated last_input due to low idle time");
                         }
-                        // If idle time is moderate but still active, nudge the timer
-                        else if idle_seconds < 15 {
-                            let current = *last_input.lock().unwrap();
-                            let time_since_last_input = Local::now().signed_duration_since(current).num_seconds();
-                            // If it's been more than 10 seconds since last update, nudge it
-                            if time_since_last_input > 10 {
-                                *last_input.lock().unwrap() = Local::now() - chrono::Duration::seconds(10);
-                                log::debug!("Nudged last_input for moderate idle time");
-                            }
-                        }
-                        // If idle time is high, don't update - let AFK detection work
                     }
                     Err(e) => {
-                        log::warn!("Failed to check Wayland idle time: {}", e);
-                        // Fallback: log when D-Bus fails, but don't assume activity
-                        // Window changes and low idle times will still update last_input
-                        if last_fallback_update.elapsed() >= tokio::time::Duration::from_secs(60) {
-                            last_fallback_update = tokio::time::Instant::now();
-                            log::info!("D-Bus idle monitoring failed - relying on window changes for activity detection");
-                        }
-
-                        // Also check for window changes as additional activity detection
-                        if last_window_check.elapsed() >= tokio::time::Duration::from_secs(2) {
-                            match tokio::join!(
-                                monitor.get_active_app_async(),
-                                monitor.get_active_window_name_async()
-                            ) {
-                                (Ok(app), Ok(window_name)) => {
-                                    let window = if window_name.is_empty() { None } else { Some(window_name) };
-                                    let current_info = (app.clone(), window.clone());
-                                    if last_window_info.as_ref() != Some(&current_info) {
-                                        // Window changed - consider this as activity
-                                        *last_input.lock().unwrap() = Local::now();
-                                        log::debug!("Updated last_input due to window change: {} -> {:?}", app, window);
-                                        last_window_info = Some(current_info);
-                                    }
-                                }
-                                _ => {
-                                    // Window detection also failed - this is bad
-                                    log::warn!("Both idle monitoring and window detection failed");
-                                }
-                            }
-                            last_window_check = tokio::time::Instant::now();
-                        }
+                        log::trace!("Wayland idle detection failed: {}", e);
                     }
                 }
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+                // Window change detection as fallback for activity
+                if last_window_check.elapsed() >= Duration::from_millis(500) {
+                    if let Ok(info) = monitor.get_active_window_info_async().await {
+                        if let Some(ref last_info) = last_window_info {
+                            if info.0 != last_info.0 || info.1 != last_info.1 {
+                                log::debug!("Activity detected via window change: '{}' -> '{}'", last_info.0, info.0);
+                                *last_input.lock().unwrap() = Local::now();
+                            }
+                        }
+                        last_window_info = Some(info);
+                    }
+                    last_window_check = tokio::time::Instant::now();
+                }
+
+                // If no activity detected for a long time, logs a warning occasionally
+                if last_fallback_update.elapsed() >= Duration::from_secs(300) {
+                    let last_input_time = *last_input.lock().unwrap();
+                    let idle_duration = Local::now().signed_duration_since(last_input_time);
+                    if idle_duration.num_seconds() > 60 {
+                        log::debug!("Wayland tracker idle for {} seconds (last activity: {})", 
+                                  idle_duration.num_seconds(), 
+                                  last_input_time.format("%H:%M:%S"));
+                    }
+                    last_fallback_update = tokio::time::Instant::now();
+                }
+
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         });
     }
 
-    // Check idle time using GNOME D-Bus interfaces
+    // Helper to check idle time via D-Bus on Wayland (GNOME/Mutter)
     pub async fn check_wayland_idle_time() -> Result<u32> {
         let connection = zbus::Connection::session().await?;
 
-        // Try GNOME Mutter Idle Monitor with proper monitor creation
-        match Self::get_mutter_idle_time(&connection).await {
-            Ok(idle_time) => Ok(idle_time),
-            Err(e1) => {
-                log::debug!("Mutter IdleMonitor failed: {}", e1);
-                // Fallback: try GNOME Session Manager
-                match connection.call_method(
-                    Some("org.gnome.SessionManager"),
-                    "/org/gnome/SessionManager/Presence",
-                    Some("org.gnome.SessionManager.Presence"),
-                    "GetIdleTime",
-                    &(),
-                ).await {
-                    Ok(response) => {
-                        let idle_time: u64 = response.body().deserialize()?;
-                        Ok((idle_time / 1000) as u32)
-                    }
-                    Err(e2) => {
-                        log::debug!("SessionManager Presence failed: {}", e2);
-                        // Try logind idle hint (systemd)
-                        match connection.call_method(
-                            Some("org.freedesktop.login1"),
-                            "/org/freedesktop/login1/session/auto",
-                            Some("org.freedesktop.login1.Session"),
-                            "GetIdleHint",
-                            &(),
-                        ).await {
-                            Ok(response) => {
-                                let idle_hint: bool = response.body().deserialize()?;
-                                // GetIdleHint returns boolean, not time
-                                // If idle, assume high idle time; if not idle, assume 0
-                                Ok(if idle_hint { 300 } else { 0 }) // 5 minutes or 0
-                            }
-                            Err(e3) => {
-                                log::debug!("logind IdleHint failed: {}", e3);
-                                // Try org.freedesktop.ScreenSaver
-                                match connection.call_method(
-                                    Some("org.freedesktop.ScreenSaver"),
-                                    "/org/freedesktop/ScreenSaver",
-                                    Some("org.freedesktop.ScreenSaver"),
-                                    "GetSessionIdleTime",
-                                    &(),
-                                ).await {
-                                    Ok(response) => {
-                                        let idle_time: u64 = response.body().deserialize()?;
-                                        Ok((idle_time / 1000) as u32)
-                                    }
-                                    Err(e4) => {
-                                        log::debug!("ScreenSaver GetSessionIdleTime failed: {}", e4);
-                                        // Try alternative ScreenSaver method
-                                        match connection.call_method(
-                                            Some("org.freedesktop.ScreenSaver"),
-                                            "/org/freedesktop/ScreenSaver",
-                                            Some("org.freedesktop.ScreenSaver"),
-                                            "GetActiveTime",
-                                            &(),
-                                        ).await {
-                                            Ok(response) => {
-                                                let active_time: u64 = response.body().deserialize()?;
-                                                Ok((active_time / 1000) as u32)
-                                            }
-                                            Err(e5) => {
-                                                log::debug!("ScreenSaver GetActiveTime failed: {}", e5);
-                                                // Last resort: try to detect if we can connect to GNOME Shell
-                                                // If GNOME Shell is responding, assume some activity
-                                                match connection.call_method(
-                                                    Some("org.gnome.Shell"),
-                                                    "/org/gnome/Shell",
-                                                    Some("org.gnome.Shell"),
-                                                    "Eval",
-                                                    &("1 + 1".to_string()),
-                                                ).await {
-                                                    Ok(_) => Ok(0), // GNOME Shell responsive, assume active
-                                                    Err(e6) => {
-                                                        log::debug!("GNOME Shell check failed: {}", e6);
-                                                        Err(anyhow::anyhow!("All idle detection methods failed"))
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Properly create and query Mutter Idle Monitor
-    async fn get_mutter_idle_time(connection: &zbus::Connection) -> Result<u32> {
-        // First try the existing core monitor
+        // GNOME Mutter IdleMonitor API
+        // Path: /org/gnome/Mutter/IdleMonitor/Core
+        // Interface: org.gnome.Mutter.IdleMonitor
+        // Method: GetIdletime
         match connection.call_method(
             Some("org.gnome.Mutter.IdleMonitor"),
             "/org/gnome/Mutter/IdleMonitor/Core",
@@ -368,10 +264,10 @@ impl App {
         }
 
         // Load history and usage (load 30 sessions for display)
-        self.history = self.database.get_recent_sessions(30).await.unwrap();
-        self.usage = self.database.get_app_usage().await.unwrap();
-        self.current_history = self.database.get_daily_sessions().await.unwrap();
-        self.refresh_categories().await.unwrap();
+        self.history = self.database.get_recent_sessions(30).await.unwrap_or_default();
+        self.usage = self.database.get_app_usage().await.unwrap_or_default();
+        self.current_history = self.database.get_daily_sessions().await.unwrap_or_default();
+        let _ = self.refresh_categories().await;
 
         // Create hierarchical usage data from sessions for Detailed Stats
         self.daily_usage = crate::ui::hierarchical::create_hierarchical_usage(&self.current_history);
@@ -379,7 +275,7 @@ impl App {
         self.monthly_usage = self.daily_usage.clone();
 
         // Create flat usage data for Today's Activity Progress
-        self.flat_daily_usage = self.database.get_daily_usage().await.unwrap();
+        self.flat_daily_usage = self.database.get_daily_usage().await.unwrap_or_default();
 
         eprintln!("Enabling raw mode...");
         if let Err(e) = enable_raw_mode() {
@@ -415,128 +311,16 @@ impl App {
                 break;
             }
 
-            // Check for AFK status every second
-            if last_afk_check.elapsed() >= afk_check_interval {
-                let time_since_last_check = last_afk_check.elapsed();
-
-                // Detect system sleep: if more than 10 minutes passed since last check, system was likely asleep
-                let sleep_threshold = Duration::from_secs(600); // 10 minutes
-                let was_system_asleep = time_since_last_check > sleep_threshold;
-
-                let idle_duration = Local::now().signed_duration_since(*self.last_input.lock().unwrap());
-                let is_currently_afk = idle_duration.num_seconds() >= afk_threshold.as_secs() as i64;
-                log::debug!("Idle duration: {} seconds, is_afk: {}", idle_duration.num_seconds(), is_currently_afk);
-
-                // Accumulate idle time in current session
-                // Only add the DELTA since last check (current_idle - previous recorded)
-                if let Some(ref mut session) = self.current_session {
-                    let current_idle_secs = idle_duration.num_seconds();
-                    // Only accumulate if idle time increased and we're not in full IDLE gap
-                    if current_idle_secs > self.last_recorded_idle_secs && current_idle_secs < 600 && !session.is_idle.unwrap_or(false) {
-                        let idle_delta = current_idle_secs - self.last_recorded_idle_secs;
-                        let accumulated_before = session.idle_accumulation_secs.unwrap_or(0);
-                        session.idle_accumulation_secs = Some(accumulated_before + idle_delta);
-                    }
-                    // Update recorded idle for next iteration
-                    self.last_recorded_idle_secs = current_idle_secs;
-                }
-
-                // If system was asleep, force AFK state for the sleep period
-                if was_system_asleep && !is_currently_afk {
-                    log::info!("System sleep detected (gap: {:.1} minutes), creating AFK session for sleep period",
-                              time_since_last_check.as_secs_f64() / 60.0);
-                    // End current session and start AFK session for the sleep period
-                    if let Some(ref session) = self.current_session
-                        && !session.is_afk.unwrap_or(false)
-                    {
-                        // Save the current session up to sleep time
-                        let mut old_session = self.current_session.take().unwrap();
-                        let sleep_start_time = Local::now() - chrono::Duration::from_std(time_since_last_check).unwrap_or(chrono::Duration::minutes(0));
-                        old_session.duration = sleep_start_time.signed_duration_since(old_session.start_time).num_seconds();
-
-                        if let Err(e) = self.database.insert_session(&old_session).await {
-                            log::error!("Failed to save session during sleep detection: {}", e);
-                        } else {
-                            log::info!("Session saved due to system sleep: {} for {:.1} minutes",
-                                      old_session.app_name, old_session.duration as f64 / 60.0);
-                        }
-
-                        // Start AFK session for sleep period with is_afk=true
-                        self.switch_app_with_afk("AFK".to_string(), Some(true)).await?;
-                        if let Some(ref mut new_session) = self.current_session {
-                            new_session.start_time = sleep_start_time;
-                            // CRITICAL FIX: Reset last_input to sleep_start_time so Wayland idle monitoring
-                            // doesn't immediately reset the AFK timer when system wakes up
-                            *self.last_input.lock().unwrap() = sleep_start_time;
-                            log::info!("Reset last_input to sleep_start_time to preserve AFK duration across sleep");
-                        }
-
-                        // Now continue with normal AFK check
-                    }
-                }
-
-                // If we have a current session, check if AFK state changed
-                if let Some(ref mut session) = self.current_session {
-                    let was_afk = session.is_afk.unwrap_or(false);
-
-                    // AFK state changed - end current session and start new one
-                    if was_afk != is_currently_afk {
-                        // Save the current session
-                        let mut old_session = self.current_session.take().unwrap();
-                        old_session.duration = Local::now().signed_duration_since(old_session.start_time).num_seconds();
-
-                        if let Err(e) = self.database.insert_session(&old_session).await {
-                            log::error!("Failed to save session on AFK state change: {}", e);
-                        } else {
-                            log::info!("Session saved on AFK state change: {} -> is_afk={}", old_session.app_name, is_currently_afk);
-                        }
-
-                        // Start new session with updated AFK state
-                        if is_currently_afk {
-                            // Starting AFK session
-                            self.switch_app("AFK".to_string()).await?;
-                            if let Some(ref mut new_session) = self.current_session {
-                                new_session.is_afk = Some(true);
-                            }
-                        } else {
-                            // Returning from AFK - get the actual active app
-                            if let Ok(active_app) = self.monitor.get_active_app_async().await {
-                                self.switch_app(active_app.clone()).await?;
-                                if let Some(ref mut new_session) = self.current_session {
-                                    new_session.is_afk = Some(false);
-                                }
-                            }
-                        }
-
-                        // Reset idle tracking for new session
-                        self.last_recorded_idle_secs = 0;
-                    }
-                }
-
-                last_afk_check = Instant::now();
-            }
-
-            // Check for app or window change (but not if we're AFK)
-            if let Ok(active_app) = self.monitor.get_active_app_async().await {
-                let active_window = self.monitor.get_active_window_name_async().await.ok();
-                let idle_duration = Local::now().signed_duration_since(*self.last_input.lock().unwrap());
-                let is_currently_afk = idle_duration.num_seconds() >= afk_threshold.as_secs() as i64;
-
-                // Only track app changes if not AFK
-                if !is_currently_afk && (active_app != self.current_app || active_window != self.current_window) {
-                    self.switch_app(active_app.clone()).await?;
-                    self.current_app = active_app;
-                    self.current_window = active_window;
-
-                    // Mark new session as not AFK
-                    if let Some(ref mut session) = self.current_session {
-                        session.is_afk = Some(false);
-                    }
-
-                    // Reset idle tracking for new session
-                    self.last_recorded_idle_secs = 0;
-                }
-            }
+            // Run core tracking logic
+            self.run_tracking_step(
+                &mut last_afk_check,
+                afk_check_interval,
+                afk_threshold,
+                &mut last_save,
+                save_interval,
+                &mut last_data_refresh,
+                data_refresh_interval,
+            ).await?;
 
             if event::poll(Duration::from_millis(100))?
                 && let Event::Key(key) = event::read()?
@@ -547,228 +331,146 @@ impl App {
 
                 log::debug!("Key pressed: {:?} in state: {:?}", key.code, self.state);
                 self.logs.push(format!("[{}] Key: {:?} State: {:?}", Local::now().format("%H:%M:%S"), key.code, self.state));
-
-                     let dashboard_view_mode = match &self.state {
-                         AppState::Dashboard { view_mode } => Some(view_mode.clone()),
-                         _ => None,
-                     };
-                     if let Some(ref view_mode) = dashboard_view_mode {
-                         match key.code {
-                             KeyCode::Char('q') => break,
-                             KeyCode::Char('r') => self.start_app_selection(),
-                             KeyCode::Char('c') => self.start_category_selection(),
-                             KeyCode::Char('l') => self.view_logs(),
-                             KeyCode::Char('C') => self.state = AppState::CommandsPopup,
-                             KeyCode::Char('d') => {
-                                 self.current_view_mode = ViewMode::Daily;
-                                 self.update_history().await?;
-                                 self.state = AppState::Dashboard { view_mode: ViewMode::Daily };
-                             }
-                             KeyCode::Char('w') => {
-                                 self.current_view_mode = ViewMode::Weekly;
-                                 self.update_history().await?;
-                                 self.state = AppState::Dashboard { view_mode: ViewMode::Weekly };
-                             }
-                             KeyCode::Char('m') => {
-                                 self.current_view_mode = ViewMode::Monthly;
-                                 self.update_history().await?;
-                                 self.state = AppState::Dashboard { view_mode: ViewMode::Monthly };
-                             }
-                             KeyCode::Char('s') => {
-                                 log::debug!("'s' key pressed - opening history popup");
-                                 self.logs.push(format!("[{}] Opening history popup", Local::now().format("%H:%M:%S")));
-                                 self.current_history = match view_mode {
-                                     ViewMode::Daily => self.database.get_daily_sessions().await.unwrap_or_default(),
-                                     ViewMode::Weekly => self.database.get_weekly_sessions().await.unwrap_or_default(),
-                                     ViewMode::Monthly => self.database.get_monthly_sessions().await.unwrap_or_default(),
-                                 };
-                                 self.state = AppState::HistoryPopup { view_mode: view_mode.clone(), scroll_position: 0 };
-                             }
-                             KeyCode::Char('b') => {
-                                 log::debug!("'b' key pressed - opening breakdown dashboard");
-                                 self.logs.push(format!("[{}] Opening breakdown dashboard", Local::now().format("%H:%M:%S")));
-                                 // Load current_history first (filtered by view mode)
-                                 self.current_history = match view_mode {
-                                     ViewMode::Daily => self.database.get_daily_sessions().await.unwrap_or_default(),
-                                     ViewMode::Weekly => self.database.get_weekly_sessions().await.unwrap_or_default(),
-                                     ViewMode::Monthly => self.database.get_monthly_sessions().await.unwrap_or_default(),
-                                 };
-                                 // Then aggregate breakdown data from current_history
-                                 self.load_breakdown_data_from_history();
-self.state = AppState::BreakdownDashboard {
-                                      view_mode: view_mode.clone(),
-                                      selected_panel: 0,
-                                      panel_scrolls: [0; 5],
-                                  };
-                             }
-                             _ => {}
-                         }
-                     } else if matches!(self.state, AppState::CommandsPopup) {
-                         match key.code {
-                             KeyCode::Esc => self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() },
-                             KeyCode::Char('q') => break,
-                             KeyCode::Char('r') => self.start_app_selection(),
-                             KeyCode::Char('c') => self.start_category_selection(),
-                             KeyCode::Char('l') => self.view_logs(),
-                             KeyCode::Char('s') => {
-                                 log::debug!("'s' key pressed from CommandsPopup - opening history popup");
-                                 self.logs.push(format!("[{}] Opening history popup from commands menu", Local::now().format("%H:%M:%S")));
-                                 self.current_history = match &self.current_view_mode {
-                                     ViewMode::Daily => self.database.get_daily_sessions().await.unwrap_or_default(),
-                                     ViewMode::Weekly => self.database.get_weekly_sessions().await.unwrap_or_default(),
-                                     ViewMode::Monthly => self.database.get_monthly_sessions().await.unwrap_or_default(),
-                                 };
-                                 self.state = AppState::HistoryPopup { view_mode: self.current_view_mode.clone(), scroll_position: 0 };
-                             }
-                             KeyCode::Char('b') => {
-                                 log::debug!("'b' key pressed from CommandsPopup - opening breakdown dashboard");
-                                 self.logs.push(format!("[{}] Opening breakdown dashboard from commands menu", Local::now().format("%H:%M:%S")));
-                                 // Load current_history first (filtered by view mode)
-                                 self.current_history = match &self.current_view_mode {
-                                     ViewMode::Daily => self.database.get_daily_sessions().await.unwrap_or_default(),
-                                     ViewMode::Weekly => self.database.get_weekly_sessions().await.unwrap_or_default(),
-                                     ViewMode::Monthly => self.database.get_monthly_sessions().await.unwrap_or_default(),
-                                 };
-                                 // Then aggregate breakdown data from current_history
-                                 self.load_breakdown_data_from_history();
-self.state = AppState::BreakdownDashboard {
-                                      view_mode: self.current_view_mode.clone(),
-                                      selected_panel: 0,
-                                      panel_scrolls: [0; 5],
-                                  };
-                             }
-                             _ => {}
-                         }
-                     } else {
-                         match &mut self.state {
-                             AppState::ViewingLogs => {
-                                 match key.code {
-                                     KeyCode::Char('q') => break,
-                                     KeyCode::Esc => self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() },
-                                     _ => self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() },
-                                 }
-                             }
-                             AppState::SelectingApp { selected_index, selected_unique_id } => {
-                                 match key.code {
-                                     KeyCode::Up => {
-                                         if *selected_index > 0 {
-                                             *selected_index -= 1;
-                                             *selected_unique_id = self.daily_usage[*selected_index].unique_id.clone();
-                                         }
-                                     }
-                                     KeyCode::Down => {
-                                         if *selected_index < self.daily_usage.len().saturating_sub(1) {
-                                             *selected_index += 1;
-                                             *selected_unique_id = self.daily_usage[*selected_index].unique_id.clone();
-                                         }
-                                     }
-                                     KeyCode::Enter => {
-                                         if let Some(item) = self.daily_usage.get(*selected_index) {
-                                             self.start_rename_app(item.unique_id.clone());
-                                         }
-                                     }
-                                     KeyCode::Esc => self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() },
-                                     _ => {}
-                                 }
-                             }
-                             AppState::SelectingCategory { selected_index, selected_unique_id, scroll_offset } => {
-                                 match key.code {
-                                     KeyCode::Up => {
-                                         if *selected_index > 0 {
-                                             *selected_index -= 1;
-                                             *selected_unique_id = self.daily_usage[*selected_index].unique_id.clone();
-                                             if *selected_index < *scroll_offset {
-                                                 *scroll_offset = *selected_index;
-                                             }
-                                         }
-                                     }
-                                     KeyCode::Down => {
-                                         if *selected_index < self.daily_usage.len().saturating_sub(1) {
-                                             *selected_index += 1;
-                                             *selected_unique_id = self.daily_usage[*selected_index].unique_id.clone();
-                                             let viewport_height = 10;
-                                             if *selected_index >= *scroll_offset + viewport_height {
-                                                 *scroll_offset = selected_index.saturating_sub(viewport_height - 1);
-                                             }
-                                         }
-                                     }
-                                     KeyCode::PageUp => {
-                                         let page_size = 10;
-                                         *selected_index = selected_index.saturating_sub(page_size);
-                                         *scroll_offset = scroll_offset.saturating_sub(page_size);
-                                         *selected_unique_id = self.daily_usage[*selected_index].unique_id.clone();
-                                     }
-                                     KeyCode::PageDown => {
-                                         let page_size = 10;
-                                         let max_index = self.daily_usage.len().saturating_sub(1);
-                                         *selected_index = (*selected_index + page_size).min(max_index);
-                                         *scroll_offset = (*scroll_offset + page_size).min(max_index.saturating_sub(9));
-                                         *selected_unique_id = self.daily_usage[*selected_index].unique_id.clone();
-                                     }
-                                     KeyCode::Enter => {
-                                         if let Some(item) = self.daily_usage.get(*selected_index) {
-                                             self.start_category_menu(item.unique_id.clone());
-                                         }
-                                     }
-                                     KeyCode::Esc => self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() },
-                                     _ => {}
-                                 }
-                             }
-                             AppState::CategoryMenu { unique_id, selected_index, scroll_offset } => {
-                                 let categories = self.categories.clone();
-                                 match key.code {
-                                     KeyCode::Up => {
-                                         if *selected_index > 0 {
-                                             *selected_index -= 1;
-                                             if *selected_index < *scroll_offset {
-                                                 *scroll_offset = *selected_index;
-                                             }
-                                         }
-                                     }
-                                     KeyCode::Down => {
-                                         if *selected_index < categories.len().saturating_sub(1) {
-                                             *selected_index += 1;
-                                             let viewport_height = 10;
-                                             if *selected_index >= *scroll_offset + viewport_height {
-                                                 *scroll_offset = selected_index.saturating_sub(viewport_height - 1);
-                                             }
-                                         }
-                                     }
-                                     KeyCode::PageUp => {
-                                         let page_size = 10;
-                                         *selected_index = selected_index.saturating_sub(page_size);
-                                         *scroll_offset = scroll_offset.saturating_sub(page_size);
-                                     }
-                                     KeyCode::PageDown => {
-                                         let page_size = 10;
-                                         let max_index = categories.len().saturating_sub(1);
-                                         *selected_index = (*selected_index + page_size).min(max_index);
-                                         *scroll_offset = (*scroll_offset + page_size).min(max_index.saturating_sub(9));
-                                     }
-                                     KeyCode::Enter => {
-                                         if let Some(category) = categories.get(*selected_index) {
-                                             let id = unique_id.clone();
-                                             let cat = category.clone();
-                                             self.handle_category_selection(id, cat).await?;
-                                         }
-                                     }
-                                     KeyCode::Esc => self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() },
-                                     _ => {}
-                                 }
-                             }
-                             AppState::Input { buffer, .. } => {
-                                 match key.code {
-                                     KeyCode::Char(c) => buffer.push(c),
-                                     KeyCode::Backspace => { buffer.pop(); }
-                                     KeyCode::Enter => self.handle_input().await?,
-                                     KeyCode::Esc => self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() },
-                                     _ => {}
-                                 }
-                             }
-                             AppState::HistoryPopup { view_mode, scroll_position } => {
+                
+                let mut should_break = false;
+                match &mut self.state {
+                    AppState::Dashboard { view_mode } => {
+                        match key.code {
+                            KeyCode::Char('q') => should_break = true,
+                            KeyCode::Char('r') => self.refresh_all_data().await?,
+                            KeyCode::Char('l') => self.state = AppState::ViewingLogs,
+                            KeyCode::Char('a') => self.start_app_selection(),
+                            KeyCode::Char('c') => self.start_category_selection(),
+                            KeyCode::Char('h') => self.state = AppState::HistoryPopup { view_mode: view_mode.clone(), scroll_position: 0 },
+                            KeyCode::Char('b') => {
+                                let vm = view_mode.clone();
+                                self.load_breakdown_data_from_history();
+                                self.state = AppState::BreakdownDashboard { view_mode: vm, selected_panel: 0, panel_scrolls: [0; 5] };
+                            }
+                            KeyCode::Tab => {
+                                let new_mode = match view_mode {
+                                    ViewMode::Daily => ViewMode::Weekly,
+                                    ViewMode::Weekly => ViewMode::Monthly,
+                                    ViewMode::Monthly => ViewMode::Daily,
+                                };
+                                *view_mode = new_mode.clone();
+                                self.current_view_mode = new_mode;
+                                self.refresh_all_data().await?;
+                            }
+                            KeyCode::Char('?') => self.state = AppState::CommandsPopup,
+                            _ => {}
+                        }
+                    }
+                    AppState::ViewingLogs => {
+                        if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') {
+                            self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() };
+                        }
+                    }
+                    AppState::SelectingApp { selected_index, selected_unique_id } => {
+                        match key.code {
+                            KeyCode::Esc => self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() },
+                            KeyCode::Up => {
+                                if *selected_index > 0 {
+                                    *selected_index -= 1;
+                                    *selected_unique_id = self.daily_usage[*selected_index].unique_id.clone();
+                                }
+                            }
+                            KeyCode::Down => {
+                                if *selected_index < self.daily_usage.len().saturating_sub(1) {
+                                    *selected_index += 1;
+                                    *selected_unique_id = self.daily_usage[*selected_index].unique_id.clone();
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let unique_id = selected_unique_id.clone();
+                                self.start_rename_app(unique_id);
+                            }
+                            _ => {}
+                        }
+                    }
+                    AppState::SelectingCategory { selected_index, selected_unique_id, scroll_offset } => {
+                        match key.code {
+                            KeyCode::Esc => self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() },
+                            KeyCode::Up => {
+                                if *selected_index > 0 {
+                                    *selected_index -= 1;
+                                    *selected_unique_id = self.daily_usage[*selected_index].unique_id.clone();
+                                    if *selected_index < *scroll_offset {
+                                        *scroll_offset = *selected_index;
+                                    }
+                                }
+                            }
+                            KeyCode::Down => {
+                                if *selected_index < self.daily_usage.len().saturating_sub(1) {
+                                    *selected_index += 1;
+                                    *selected_unique_id = self.daily_usage[*selected_index].unique_id.clone();
+                                    if *selected_index >= *scroll_offset + 10 { // Visible area size
+                                        *scroll_offset = *selected_index - 9;
+                                    }
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let unique_id = selected_unique_id.clone();
+                                self.start_category_menu(unique_id);
+                            }
+                            _ => {}
+                        }
+                    }
+                    AppState::CategoryMenu { unique_id, selected_index, scroll_offset } => {
+                        let categories = self.categories.clone();
+                        match key.code {
+                            KeyCode::Esc => {
+                                let uid = unique_id.clone();
+                                self.state = AppState::SelectingCategory { 
+                                    selected_index: self.daily_usage.iter().position(|item| item.unique_id == uid).unwrap_or(0),
+                                    selected_unique_id: uid,
+                                    scroll_offset: 0
+                                }
+                            },
+                            KeyCode::Up => {
+                                if *selected_index > 0 {
+                                    *selected_index -= 1;
+                                    if *selected_index < *scroll_offset {
+                                        *scroll_offset = *selected_index;
+                                    }
+                                }
+                            }
+                            KeyCode::Down => {
+                                if *selected_index < categories.len().saturating_sub(1) {
+                                    *selected_index += 1;
+                                    if *selected_index >= *scroll_offset + 10 {
+                                        *scroll_offset = *selected_index - 9;
+                                    }
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let app_name = unique_id.clone();
+                                let category = categories[*selected_index].clone();
+                                self.handle_category_selection(app_name, category).await?;
+                            }
+                            _ => {}
+                        }
+                    }
+                    AppState::Input { buffer, .. } => {
+                        match key.code {
+                            KeyCode::Esc => self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() },
+                            KeyCode::Enter => {
+                                self.handle_input().await?;
+                            }
+                            KeyCode::Char(c) => buffer.push(c),
+                            KeyCode::Backspace => { buffer.pop(); }
+                            _ => {}
+                        }
+                    }
+                    AppState::CommandsPopup => {
+                        if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') || key.code == KeyCode::Char('?') {
+                            self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() };
+                        }
+                    }
+                    AppState::HistoryPopup { view_mode, scroll_position } => {
                                  match key.code {
                                      KeyCode::Esc => self.state = AppState::Dashboard { view_mode: view_mode.clone() },
-                                     KeyCode::Char('q') => break,
+                                     KeyCode::Char('q') => should_break = true,
                                      KeyCode::Up => {
                                          if *scroll_position > 0 {
                                              *scroll_position -= 1;
@@ -793,12 +495,9 @@ self.state = AppState::BreakdownDashboard {
 AppState::BreakdownDashboard { view_mode, selected_panel, panel_scrolls } => {
                                   match key.code {
                                       KeyCode::Esc => self.state = AppState::Dashboard { view_mode: view_mode.clone() },
-                                      KeyCode::Char('q') => break,
+                                      KeyCode::Char('q') => should_break = true,
                                       KeyCode::Tab => {
                                           *selected_panel = (*selected_panel + 1) % 5;
-                                      }
-                                      KeyCode::Enter => {
-                                          // Enter selects/highlights the current panel - visual feedback only
                                       }
                                       KeyCode::Up => {
                                           panel_scrolls[*selected_panel] = panel_scrolls[*selected_panel].saturating_sub(1);
@@ -815,78 +514,28 @@ AppState::BreakdownDashboard { view_mode, selected_panel, panel_scrolls } => {
                                       _ => {}
                                   }
                               }
-                             _ => {}
-                         }
-                     }
-            }
-
-            // Auto save every hour
-            if last_save.elapsed() >= save_interval
-                && let Some(session) = &mut self.current_session
-            {
-                session.duration = Local::now().signed_duration_since(session.start_time).num_seconds();
-                if let Err(e) = self.database.insert_session(session).await {
-                    log::error!("Failed to auto save session: {}", e);
-                } else {
-                    last_save = Instant::now();
                 }
-            }
-
-            // Refresh dashboard data every 5 seconds for near real-time updates
-            if last_data_refresh.elapsed() >= data_refresh_interval {
-                self.history = self.database.get_recent_sessions(30).await.unwrap_or_default();
-                self.usage = self.database.get_app_usage().await.unwrap_or_default();
-
-                // Update current_history based on current view mode
-                if let AppState::Dashboard { ref view_mode } = self.state {
-                    self.current_history = match view_mode {
-                        ViewMode::Daily => self.database.get_daily_sessions().await.unwrap_or_default(),
-                        ViewMode::Weekly => self.database.get_weekly_sessions().await.unwrap_or_default(),
-                        ViewMode::Monthly => self.database.get_monthly_sessions().await.unwrap_or_default(),
-                    };
-
-                    // Create hierarchical usage data from current_history for Detailed Stats
-                    self.daily_usage = crate::ui::hierarchical::create_hierarchical_usage(&self.current_history);
-                    self.weekly_usage = self.daily_usage.clone();
-                    self.monthly_usage = self.daily_usage.clone();
-
-                    // Create flat usage data for Today's Activity Progress
-                    self.flat_daily_usage = self.database.get_daily_usage().await.unwrap_or_default();
-                }
-
-                // Update current session duration in history for real-time display
-                if let Some(current_session) = &self.current_session {
-                    let current_duration = Local::now().signed_duration_since(current_session.start_time).num_seconds();
-                    // Update the most recent session in history if it matches the current one
-                    if let Some(latest_session) = self.current_history.first_mut()
-                        && latest_session.app_name == current_session.app_name
-                        && latest_session.start_time == current_session.start_time
-                    {
-                        latest_session.duration = current_duration;
-                        // Update renamed fields for persistence
-                        latest_session.browser_page_title_renamed = current_session.browser_page_title_renamed.clone();
-                        latest_session.terminal_directory_renamed = current_session.terminal_directory_renamed.clone();
-                        latest_session.editor_filename_renamed = current_session.editor_filename_renamed.clone();
-                        latest_session.tmux_window_name_renamed = current_session.tmux_window_name_renamed.clone();
-                    }
-                }
-
-                last_data_refresh = Instant::now();
-                log::debug!("Dashboard data refreshed");
+                if should_break { break; }
             }
         }
 
-        // Save current session on exit
+        // Save current session before exiting
         if let Some(mut session) = self.current_session.take() {
             session.duration = Local::now().signed_duration_since(session.start_time).num_seconds();
 
-            // Save ALL sessions regardless of duration
-            if let Err(e) = self.database.insert_session(&session).await {
+            // Save using update if ID exists
+            let save_result = if let Some(_id) = session.id {
+                self.database.update_session(&session).await
+            } else {
+                self.database.insert_session(&session).await.map(|_| ())
+            };
+
+            if let Err(e) = save_result {
                 log::error!("Failed to save session on exit: {}", e);
                 self.logs.push(format!("Failed to save session: {}", e));
             } else {
-                self.history = self.database.get_recent_sessions(30).await?;
-                self.usage = self.database.get_app_usage().await?;
+                self.history = self.database.get_recent_sessions(30).await.unwrap_or_default();
+                self.usage = self.database.get_app_usage().await.unwrap_or_default();
                 self.logs.push(format!("[{}] Ended session: {} for {}s", Local::now().format("%H:%M:%S"), session.app_name, session.duration));
             }
         }
@@ -898,6 +547,313 @@ AppState::BreakdownDashboard { view_mode, selected_panel, panel_scrolls } => {
         if let Err(e) = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture) {
             log::warn!("Failed to leave alternate screen: {}", e);
         }
+        Ok(())
+    }
+
+    pub async fn run_daemon(&mut self) -> Result<()> {
+        log::info!("Starting in background mode (daemon)...");
+
+        // Set up signal handlers for graceful shutdown on SIGTERM/SIGINT
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+        // Register signal handlers
+        signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown_flag))?;
+        signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown_flag))?;
+
+        // Start tracking initial app
+        self.start_tracking().await?;
+
+        // Fix any old category data from previous versions
+        if let Err(e) = self.database.fix_old_categories().await {
+            log::warn!("Failed to fix old categories: {}", e);
+        }
+
+        let mut last_save = Instant::now();
+        let save_interval = Duration::from_secs(3600); // 1 hour
+
+        let mut last_data_refresh = Instant::now();
+        let data_refresh_interval = Duration::from_secs(5); // Refresh dashboard data every 5 seconds for near real-time updates
+
+        let mut last_afk_check = Instant::now();
+        let afk_check_interval = Duration::from_secs(1); // Check AFK status every second
+        let afk_threshold = Duration::from_secs(300); // 5 minutes of idle = AFK
+
+        loop {
+            // Check for shutdown signal (SIGTERM/SIGINT)
+            if shutdown_flag.load(Ordering::Relaxed) {
+                log::info!("Received shutdown signal, saving and exiting...");
+                break;
+            }
+
+            // Run core tracking logic
+            self.run_tracking_step(
+                &mut last_afk_check,
+                afk_check_interval,
+                afk_threshold,
+                &mut last_save,
+                save_interval,
+                &mut last_data_refresh,
+                data_refresh_interval,
+            ).await?;
+
+            // Sleep to reduce CPU usage
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Save current session before exiting
+        if let Some(mut session) = self.current_session.take() {
+            session.duration = Local::now().signed_duration_since(session.start_time).num_seconds();
+
+            // Save using update if ID exists
+            let save_result = if let Some(_id) = session.id {
+                self.database.update_session(&session).await
+            } else {
+                self.database.insert_session(&session).await.map(|_| ())
+            };
+
+            if let Err(e) = save_result {
+                log::error!("Failed to save session on exit: {}", e);
+            } else {
+                log::info!("Saved session on exit: {} for {}s", session.app_name, session.duration);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_tracking_step(
+        &mut self,
+        last_afk_check: &mut Instant,
+        afk_check_interval: Duration,
+        afk_threshold: Duration,
+        last_save: &mut Instant,
+        save_interval: Duration,
+        last_data_refresh: &mut Instant,
+        data_refresh_interval: Duration,
+    ) -> Result<()> {
+        // Check for AFK status and window changes every second
+        if last_afk_check.elapsed() >= afk_check_interval {
+            let time_since_last_check = last_afk_check.elapsed();
+
+            // Get current window info to detect activity even if rdev/dbus fails (Wayland fallback)
+            let active_info = self.monitor.get_active_window_info_async().await.ok();
+            if let Some((ref active_app, ref active_window)) = active_info {
+                if active_app != &self.current_app || active_window != &self.current_window {
+                     // Window changed -> User is active
+                    if self.current_app != "AFK" {
+                        log::info!("Activity detected via window change: '{}' -> '{}'", self.current_app, active_app);
+                    }
+                    *self.last_input.lock().unwrap() = Local::now();
+                }
+            }
+
+            // Detect system sleep: if more than 10 minutes passed since last check, system was likely asleep
+            let sleep_threshold = Duration::from_secs(600); // 10 minutes
+            let was_system_asleep = time_since_last_check > sleep_threshold;
+
+            let idle_duration = Local::now().signed_duration_since(*self.last_input.lock().unwrap());
+            let is_currently_afk = idle_duration.num_seconds() >= afk_threshold.as_secs() as i64;
+            log::debug!("Idle duration: {} seconds, is_afk: {}", idle_duration.num_seconds(), is_currently_afk);
+
+            // Accumulate idle time in current session
+            // Only add the DELTA since last check (current_idle - previous recorded)
+            if let Some(ref mut session) = self.current_session {
+                let current_idle_secs = idle_duration.num_seconds();
+                // Only accumulate if idle time increased and we're not in full IDLE gap
+                if current_idle_secs > self.last_recorded_idle_secs && current_idle_secs < 600 && !session.is_idle.unwrap_or(false) {
+                    let idle_delta = current_idle_secs - self.last_recorded_idle_secs;
+                    let accumulated_before = session.idle_accumulation_secs.unwrap_or(0);
+                    session.idle_accumulation_secs = Some(accumulated_before + idle_delta);
+                }
+                // Update recorded idle for next iteration
+                self.last_recorded_idle_secs = current_idle_secs;
+            }
+
+            // If system was asleep, force AFK state for the sleep period
+            if was_system_asleep && !is_currently_afk {
+                log::info!("System sleep detected (gap: {:.1} minutes), creating AFK session for sleep period",
+                          time_since_last_check.as_secs_f64() / 60.0);
+                // End current session and start AFK session for the sleep period
+                if let Some(ref session) = self.current_session
+                    && !session.is_afk.unwrap_or(false)
+                {
+                    // Save the current session up to sleep time
+                    let mut old_session = self.current_session.take().unwrap();
+                    let sleep_start_time = Local::now() - chrono::Duration::from_std(time_since_last_check).unwrap_or(chrono::Duration::minutes(0));
+                    old_session.duration = sleep_start_time.signed_duration_since(old_session.start_time).num_seconds();
+
+                    let save_result = if let Some(_id) = old_session.id {
+                        self.database.update_session(&old_session).await
+                    } else {
+                        self.database.insert_session(&old_session).await.map(|_| ())
+                    };
+
+                    if let Err(e) = save_result {
+                        log::error!("Failed to save session during sleep detection: {}", e);
+                    } else {
+                        log::info!("Session saved due to system sleep: {} for {:.1} minutes",
+                                  old_session.app_name, old_session.duration as f64 / 60.0);
+                    }
+
+                    // Start AFK session for sleep period with is_afk=true
+                    self.switch_app_with_afk("AFK".to_string(), None, Some(true)).await?;
+                    if let Some(ref mut new_session) = self.current_session {
+                        new_session.start_time = sleep_start_time;
+                        // CRITICAL FIX: Reset last_input to sleep_start_time so Wayland idle monitoring
+                        // doesn't immediately reset the AFK timer when system wakes up
+                        *self.last_input.lock().unwrap() = sleep_start_time;
+                        log::info!("Reset last_input to sleep_start_time to preserve AFK duration across sleep");
+                    }
+
+                    // Now continue with normal AFK check
+                }
+            }
+
+            // If we have a current session, check if AFK state changed
+            if let Some(ref mut session) = self.current_session {
+                let was_afk = session.is_afk.unwrap_or(false);
+
+                // AFK state changed - end current session and start new one
+                if was_afk != is_currently_afk {
+                    // Save the current session
+                    let mut old_session = self.current_session.take().unwrap();
+                    old_session.duration = Local::now().signed_duration_since(old_session.start_time).num_seconds();
+
+                    let save_result = if let Some(_id) = old_session.id {
+                        self.database.update_session(&old_session).await
+                    } else {
+                        self.database.insert_session(&old_session).await.map(|_| ())
+                    };
+
+                    if let Err(e) = save_result {
+                        log::error!("Failed to save session on AFK state change: {}", e);
+                    } else {
+                        log::info!("Session saved on AFK state change: {} -> is_afk={}", old_session.app_name, is_currently_afk);
+                    }
+
+                    // Start new session with updated AFK state
+                    if is_currently_afk {
+                        // Starting AFK session
+                        self.switch_app_with_afk("AFK".to_string(), None, Some(true)).await?;
+                        if let Some(ref mut new_session) = self.current_session {
+                            new_session.is_afk = Some(true);
+                        }
+                    } else {
+                        // Returning from AFK - use detected info or fallback
+                        let (app, win) = if let Some(info) = active_info {
+                            info
+                        } else if let Ok(active_app) = self.monitor.get_active_app_async().await {
+                            (active_app, None)
+                        } else {
+                            ("unknown".to_string(), None)
+                        };
+
+                        self.switch_app_with_window(app, win).await?;
+                        if let Some(ref mut new_session) = self.current_session {
+                            new_session.is_afk = Some(false);
+                        }
+                    }
+
+                    // Reset idle tracking for new session
+                    self.last_recorded_idle_secs = 0;
+                }
+            }
+
+            *last_afk_check = Instant::now();
+        }
+
+        // Check for app or window change (but not if we're AFK)
+        // Use the info we might have already fetched for activity detection
+        let active_info = self.monitor.get_active_window_info_async().await.ok();
+        if let Some((active_app, active_window)) = active_info {
+            let idle_duration = Local::now().signed_duration_since(*self.last_input.lock().unwrap());
+            let is_currently_afk = idle_duration.num_seconds() >= afk_threshold.as_secs() as i64;
+
+            // Only track app changes if not AFK
+            if !is_currently_afk && (active_app != self.current_app || active_window != self.current_window) {
+                self.switch_app_with_window(active_app.clone(), active_window.clone()).await?;
+                self.current_app = active_app;
+                self.current_window = active_window;
+
+                // Mark new session as not AFK
+                if let Some(ref mut session) = self.current_session {
+                    session.is_afk = Some(false);
+                }
+
+                // Reset idle tracking for new session
+                self.last_recorded_idle_secs = 0;
+            }
+        }
+
+        // Auto save every hour
+        if last_save.elapsed() >= save_interval
+            && let Some(session) = &mut self.current_session
+        {
+            session.duration = Local::now().signed_duration_since(session.start_time).num_seconds();
+
+            let save_result = if let Some(_id) = session.id {
+                self.database.update_session(session).await
+            } else {
+                match self.database.insert_session(session).await {
+                    Ok(id) => {
+                        session.id = Some(id);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+
+            if let Err(e) = save_result {
+                log::error!("Failed to auto save session: {}", e);
+            } else {
+                *last_save = Instant::now();
+                log::info!("Auto-saved session: {} for {}s", session.app_name, session.duration);
+            }
+        }
+
+        // Refresh dashboard data every 5 seconds for near real-time updates
+        if last_data_refresh.elapsed() >= data_refresh_interval {
+            self.history = self.database.get_recent_sessions(30).await.unwrap_or_default();
+            self.usage = self.database.get_app_usage().await.unwrap_or_default();
+
+            // Update current_history based on current view mode
+            if let AppState::Dashboard { ref view_mode } = self.state {
+                self.current_history = match view_mode {
+                    ViewMode::Daily => self.database.get_daily_sessions().await.unwrap_or_default(),
+                    ViewMode::Weekly => self.database.get_weekly_sessions().await.unwrap_or_default(),
+                    ViewMode::Monthly => self.database.get_monthly_sessions().await.unwrap_or_default(),
+                };
+
+                // Create hierarchical usage data from current_history for Detailed Stats
+                self.daily_usage = crate::ui::hierarchical::create_hierarchical_usage(&self.current_history);
+                self.weekly_usage = self.daily_usage.clone();
+                self.monthly_usage = self.daily_usage.clone();
+
+                // Create flat usage data for Today's Activity Progress
+                self.flat_daily_usage = self.database.get_daily_usage().await.unwrap_or_default();
+            }
+
+            // Update current session duration in history for real-time display
+            if let Some(current_session) = &self.current_session {
+                let current_duration = Local::now().signed_duration_since(current_session.start_time).num_seconds();
+                // Update the most recent session in history if it matches the current one
+                if let Some(latest_session) = self.current_history.first_mut()
+                    && latest_session.app_name == current_session.app_name
+                    && latest_session.start_time == current_session.start_time
+                {
+                    latest_session.duration = current_duration;
+                    // Update renamed fields for persistence
+                    latest_session.browser_page_title_renamed = current_session.browser_page_title_renamed.clone();
+                    latest_session.terminal_directory_renamed = current_session.terminal_directory_renamed.clone();
+                    latest_session.editor_filename_renamed = current_session.editor_filename_renamed.clone();
+                    latest_session.tmux_window_name_renamed = current_session.tmux_window_name_renamed.clone();
+                }
+            }
+
+            *last_data_refresh = Instant::now();
+            log::debug!("Dashboard data refreshed");
+        }
+
         Ok(())
     }
 
@@ -956,11 +912,11 @@ AppState::BreakdownDashboard { view_mode, selected_panel, panel_scrolls } => {
         Ok(())
     }
 
-    async fn switch_app(&mut self, new_app: String) -> Result<()> {
-        self.switch_app_with_afk(new_app, None).await
+    async fn switch_app_with_window(&mut self, new_app: String, window_name: Option<String>) -> Result<()> {
+        self.switch_app_with_afk(new_app, window_name, None).await
     }
 
-    async fn switch_app_with_afk(&mut self, new_app: String, is_afk: Option<bool>) -> Result<()> {
+    async fn switch_app_with_afk(&mut self, new_app: String, window_name: Option<String>, is_afk: Option<bool>) -> Result<()> {
         let ctx = tracking::TrackingContext {
             monitor: &self.monitor,
             database: &self.database,
@@ -973,9 +929,9 @@ AppState::BreakdownDashboard { view_mode, selected_panel, panel_scrolls } => {
         };
 
         let result = if let Some(afk_flag) = is_afk {
-            tracking::switch_app_with_afk(&ctx, self.current_session.take(), new_app, Self::categorize_app, Some(afk_flag)).await?
+            tracking::switch_app_with_afk(&ctx, self.current_session.take(), new_app, window_name, Self::categorize_app, Some(afk_flag)).await?
         } else {
-            tracking::switch_app(&ctx, self.current_session.take(), new_app, Self::categorize_app).await?
+            tracking::switch_app(&ctx, self.current_session.take(), new_app, window_name, Self::categorize_app).await?
         };
 
         // If session was saved, refresh all data
@@ -1074,10 +1030,6 @@ AppState::BreakdownDashboard { view_mode, selected_panel, panel_scrolls } => {
         Ok(())
     }
 
-    fn view_logs(&mut self) {
-        self.state = AppState::ViewingLogs;
-    }
-
     pub fn is_afk(&self, threshold_secs: i64) -> bool {
         let last = *self.last_input.lock().unwrap();
         Local::now().signed_duration_since(last).num_seconds() > threshold_secs
@@ -1156,17 +1108,6 @@ AppState::BreakdownDashboard { view_mode, selected_panel, panel_scrolls } => {
         }
         // Fall back to pattern matching for backward compatibility
         Self::categorize_app(app)
-    }
-
-    async fn update_history(&mut self) -> Result<()> {
-        if let AppState::Dashboard { ref view_mode } = self.state {
-            self.current_history = match view_mode {
-                ViewMode::Daily => self.database.get_daily_sessions().await?,
-                ViewMode::Weekly => self.database.get_weekly_sessions().await?,
-                ViewMode::Monthly => self.database.get_monthly_sessions().await?,
-            };
-        }
-        Ok(())
     }
 
     async fn refresh_all_data(&mut self) -> Result<()> {
@@ -1253,7 +1194,7 @@ AppState::BreakdownDashboard { view_mode, selected_panel, panel_scrolls } => {
 
                 if result.should_refresh {
                     self.refresh_all_data().await?;
-                self.refresh_categories().await?;
+                    self.refresh_categories().await?;
                 }
 
                 self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() };

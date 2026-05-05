@@ -149,6 +149,239 @@ impl AppMonitor {
         Ok((focused_window.wm_class.clone(), focused_window.title.clone()))
     }
 
+    // Get both app and window info in a single call
+    pub async fn get_active_window_info_async(&self) -> Result<(String, Option<String>)> {
+        // Try active-win-pos-rs first (works for X11 and some Wayland compositors)
+        match get_active_window() {
+            Ok(active_window) => {
+                let app_name = self.fix_app_name(active_window.app_name.clone());
+                log::info!("Detected app: {}", app_name);
+                let mut window_title = if active_window.title.is_empty() || active_window.title == active_window.app_name {
+                    None
+                } else {
+                    Some(active_window.title.clone())
+                };
+
+                // Enhance title for terminal apps if process_id is available
+                if Self::is_terminal_app(&app_name) {
+                    let current_title = window_title.as_deref().unwrap_or("");
+                    log::info!("Main path terminal title before enhancement: '{}'", current_title);
+
+                    // Extract directory from prompt if it looks like a shell prompt
+                    let mut enhanced = if current_title.contains("@") && current_title.contains(": ") {
+                        current_title.split(": ").last().unwrap_or(current_title).to_string()
+                    } else {
+                        current_title.to_string()
+                    };
+                    log::info!("Main path terminal title after directory extraction: '{}'", enhanced);
+
+                    if active_window.process_id != 0 {
+                        let pid = active_window.process_id;
+                        enhanced = {
+                             #[cfg(target_os = "linux")]
+                             { if let Some(info) = Self::inspect_process_tree(pid) {
+                                 let mut title = enhanced;
+                                 if let Some(window) = info.tmux_window {
+                                     title = format!("{} - {}", window, title);
+                                 } else if info.has_tmux {
+                                     let session = info.tmux_session.unwrap_or("session".to_string());
+                                     title = format!("tmux: {} - {}", session, title);
+                                 }
+                                 if let Some(editor) = info.editor_info {
+                                     title = format!("{} ({}) - {}", editor.filename, editor.filepath, title);
+                                 }
+                                 title
+                             } else {
+                                 enhanced
+                             } }
+                             #[cfg(not(target_os = "linux"))]
+                             { enhanced }
+                        };
+                    }
+
+                    if enhanced != current_title {
+                        window_title = Some(enhanced);
+                    }
+                }
+                return Ok((app_name, window_title));
+            }
+            Err(_) => {
+                // Fallbacks based on platform/session type
+                if self.use_wayland {
+                    // Try Hyprland first if detected
+                    if self.use_hyprland {
+                        match Self::get_active_window_hyprland().await {
+                            Ok((wm_class, title)) => {
+                                let app_name = self.fix_app_name(wm_class);
+                                log::info!("Detected app (Hyprland): {}", app_name);
+                                return Ok((app_name, Some(title)));
+                            }
+                            Err(e) => {
+                                log::debug!("Hyprland window detection failed: {}, trying GNOME D-Bus", e);
+                            }
+                        }
+                    }
+
+                    // Try GNOME extension for Wayland
+                    if let Ok((wm_class, title)) = Self::get_active_window_wayland().await {
+                        let app_name = self.fix_app_name(wm_class);
+                        return Ok((app_name, Some(title)));
+                    }
+                } else {
+                    // Try GNOME extension for Wayland
+                    match Self::get_active_window_wayland().await {
+                        Ok((wm_class, mut title)) => {
+                            log::info!("Wayland fallback title: '{}'", title);
+                            let app_name = self.fix_app_name(wm_class);
+                            // Extract directory from prompt if it looks like a shell prompt
+                            if Self::is_terminal_app(&app_name) && title.contains("@") && title.contains(": ")
+                                && let Some(dir) = title.split(": ").last() {
+                                    title = dir.to_string();
+                                    log::info!("Wayland fallback title after extraction: '{}'", title);
+                                }
+                            return Ok((app_name, Some(title)));
+                        }
+                        Err(_) => {
+                            // Try xdotool/xprop for X11 fallback on Linux
+                            #[cfg(target_os = "linux")]
+                            {
+                                if let Ok((wm_class, title)) = Self::get_active_window_x11().await {
+                                    let app_name = self.fix_app_name(wm_class);
+                                    return Ok((app_name, Some(title)));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // macOS AppleScript fallback
+                #[cfg(target_os = "macos")]
+                {
+                    if let Ok((app, title, pid)) = Self::get_active_window_info_macos().await {
+                        let app_name = self.fix_app_name(app);
+                        return Ok((app_name, if title.is_empty() { None } else { Some(title) }));
+                    }
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("Failed to get window info"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn inspect_process_tree(pid: u64) -> Option<process_inspection::ProcessInfo> {
+        process_inspection::inspect_process_tree(pid)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn get_active_window_x11() -> Result<(String, String)> {
+        use std::process::Command;
+
+        // Get focused window ID
+        let window_id_output = Command::new("xdotool")
+            .arg("getwindowfocus")
+            .output()?;
+
+        if !window_id_output.status.success() {
+            return Err(anyhow::anyhow!("xdotool getwindowfocus failed"));
+        }
+
+        let wid = String::from_utf8_lossy(&window_id_output.stdout).trim().to_string();
+
+        // Get window name
+        let title_output = Command::new("xdotool")
+            .arg("getwindowname")
+            .arg(&wid)
+            .output()?;
+
+        if !title_output.status.success() {
+            return Err(anyhow::anyhow!("xdotool getwindowname failed"));
+        }
+
+        let title = String::from_utf8_lossy(&title_output.stdout).trim().to_string();
+
+        // Get WM_CLASS
+        let wm_class_output = Command::new("xprop")
+            .arg("-id")
+            .arg(&wid)
+            .arg("WM_CLASS")
+            .output()?;
+
+        if !wm_class_output.status.success() {
+            return Err(anyhow::anyhow!("xprop WM_CLASS failed"));
+        }
+
+        let wm_class_str = String::from_utf8_lossy(&wm_class_output.stdout);
+        let class = wm_class_str
+            .lines()
+            .find(|line| line.contains("WM_CLASS"))
+            .and_then(|line| line.split('"').nth(1))
+            .unwrap_or("")
+            .to_string();
+
+        Ok((class, title))
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn get_active_window_info_macos() -> Result<(String, String, u64)> {
+        use std::process::Command;
+
+        // Use System Events to get window info - works reliably for all apps
+        let script = r#"
+            tell application "System Events"
+                set frontApp to first application process whose frontmost is true
+                set appName to name of frontApp
+                set pid to unix id of frontApp
+                try
+                    set windowTitle to name of front window of frontApp
+                    return appName & "|" & windowTitle & "|" & pid
+                on error
+                    return appName & "|" & "|" & pid
+                end try
+            end tell
+        "#;
+
+        let output = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .output()?;
+
+        if output.status.success() {
+            let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+            let parts: Vec<&str> = result.split('|').collect();
+            if parts.len() >= 3 {
+                let app_name = parts[0].trim().to_string();
+                let window_title = parts[1].trim().to_string();
+                if let Ok(pid) = parts[2].trim().parse::<u64>() {
+                    log::debug!("AppleScript returned: app='{}', title='{}', pid={}", app_name, window_title, pid);
+
+                    if !app_name.is_empty() {
+                        return Ok((app_name, window_title, pid));
+                    }
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!("Failed to get window info via AppleScript"))
+    }
+
+    fn is_terminal_app(app: &str) -> bool {
+        let app_lower = app.to_lowercase();
+        app_lower.contains("terminal") ||
+        app_lower.contains("iterm") ||
+        app_lower.contains("alacritty") ||
+        app_lower.contains("cmd") ||
+        app_lower.contains("powershell") ||
+        app_lower.contains("wt") ||
+        app_lower == "hyper" ||
+        app_lower == "tabby" ||
+        app_lower == "warp" ||
+        app_lower.contains("kitty") ||
+        app_lower.contains("konsole") ||
+        app_lower.contains("wezterm")
+    }
+
     // Get both app and window info in a single call (more efficient for macOS AppleScript)
     pub async fn get_active_app_async(&self) -> Result<String> {
         if self.use_wayland {

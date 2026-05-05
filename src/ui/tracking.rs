@@ -90,15 +90,17 @@ pub async fn switch_app(
     ctx: &TrackingContext<'_>,
     current_session: Option<Session>,
     new_app: String,
+    window_name: Option<String>,
     categorize_fn: fn(&str) -> (String, ratatui::style::Color),
 ) -> Result<SwitchResult> {
-    switch_app_with_afk(ctx, current_session, new_app, categorize_fn, None).await
+    switch_app_with_afk(ctx, current_session, new_app, window_name, categorize_fn, None).await
 }
 
 pub async fn switch_app_with_afk(
     ctx: &TrackingContext<'_>,
     current_session: Option<Session>,
     new_app: String,
+    window_name: Option<String>,
     categorize_fn: fn(&str) -> (String, ratatui::style::Color),
     is_afk: Option<bool>,
 ) -> Result<SwitchResult> {
@@ -109,8 +111,14 @@ pub async fn switch_app_with_afk(
     if let Some(mut session) = current_session {
         session.duration = Local::now().signed_duration_since(session.start_time).num_seconds();
 
-        // Save ALL sessions regardless of duration
-        if let Err(e) = ctx.database.insert_session(&session).await {
+        // Save session using update if it has an ID, otherwise insert
+        let save_result = if let Some(_id) = session.id {
+            ctx.database.update_session(&session).await
+        } else {
+            ctx.database.insert_session(&session).await.map(|_| ())
+        };
+
+        if let Err(e) = save_result {
             log::error!("Failed to save session: {}", e);
             logs.push(format!("[{}] Failed to save session: {}", Local::now().format("%H:%M:%S"), e));
             saved_session = None;
@@ -123,7 +131,11 @@ pub async fn switch_app_with_afk(
     }
 
     // Start new session
-    let window_name = ctx.monitor.get_active_window_name_async().await.ok();
+    let window_name = if window_name.is_some() {
+        window_name
+    } else {
+        ctx.monitor.get_active_window_name_async().await.ok()
+    };
     let start_time = Local::now();
     let (category_name, _) = categorize_fn(&new_app);
 

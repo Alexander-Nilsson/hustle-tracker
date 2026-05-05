@@ -162,8 +162,28 @@ Why? On macOS/Windows, if the tracking runs in the dashboard window, it can't se
 ## Special Notes
 
 **Wayland users (Linux)**:
-- **Hyprland**: Window tracking works out of the box via `hyprctl` (no extra setup needed).
+- **Hyprland**: Window tracking works out of the box via `hyprctl`. For background tracking, use `hustle_daemon` in your config.
 - **GNOME**: Install the [Window Calls extension](https://extensions.gnome.org/extension/4724/window-calls/) for window tracking.
+
+## Arch Linux / Hyprland Setup (Recommended)
+
+For the best experience on Hyprland (Arch Linux), use the dedicated daemon for background tracking:
+
+1. **Build & Install**:
+   ```bash
+   cargo build --release
+   sudo cp target/release/hustle_tracker /usr/local/bin/
+   sudo cp target/release/hustle_daemon /usr/local/bin/
+   ```
+
+2. **Auto-start with Hyprland**:
+   Add this to your `~/.config/hypr/hyprland.conf`:
+   ```ini
+   exec-once = hustle_daemon
+   ```
+
+3. **View Dashboard**:
+   Simply run `hustle_tracker` in your favorite terminal.
 
 **First time running**: The app creates secure database credentials automatically. You don't need to configure anything.
 
