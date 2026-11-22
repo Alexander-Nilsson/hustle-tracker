@@ -809,6 +809,24 @@ pub fn draw_stats(f: &mut Frame, area: Rect, data: &[crate::ui::hierarchical::Hi
         stats_items.push(ListItem::new(Line::from(format!("📁 Top project: {} ({}h {}m)", proj, h, m))));
     }
 
+    use chrono::Timelike;
+    // Hour-of-day heatmap
+    let mut hours = [0i64; 24];
+    for sess in &app.current_history {
+        let h = sess.start_time.hour() as usize;
+        hours[h] += 1;
+    }
+    if let Some(sess) = &app.current_session {
+        let h = sess.start_time.hour() as usize;
+        hours[h] += 1;
+    }
+    let maxh = hours.iter().copied().max().unwrap_or(1).max(1);
+    let heat: String = hours.iter().map(|&c| {
+        let level = (c * 8 / maxh) as usize;
+        [' ', '▁','▂','▃','▄','▅','▆','▇','█'][level.min(8)]
+    }).collect();
+    stats_items.push(ListItem::new(Line::from(format!("🕐 Hours: {}", heat))));
+
     let stats_list = List::new(stats_items)
         .block(Block::default().borders(Borders::ALL).title(stats_title));
     f.render_widget(stats_list, area);
