@@ -36,6 +36,7 @@ impl Daemon {
 
         // Start input monitoring thread
         Self::start_input_monitoring(Arc::clone(&last_input), Arc::clone(&keystroke_count), Arc::clone(&backspace_count), Arc::clone(&mouse_click_count), Arc::clone(&scroll_ticks));
+        Self::start_evdev_monitoring(Arc::clone(&last_input));
 
         Self {
             database,
@@ -86,6 +87,29 @@ impl Daemon {
             };
             if let Err(error) = listen(callback) {
                 eprintln!("Error listening for input events in daemon: {:?}", error);
+            }
+        });
+    }
+
+    fn start_evdev_monitoring(last_input: Arc<Mutex<DateTime<Local>>>) {
+        std::thread::spawn(move || {
+            let devices: Vec<_> = evdev::enumerate().collect();
+            for (_, mut dev) in devices {
+                let last_input = Arc::clone(&last_input);
+                std::thread::spawn(move || {
+                    loop {
+                        match dev.fetch_events() {
+                            Ok(events) => {
+                                for _ in events {
+                                    *last_input.lock().unwrap() = Local::now();
+                                }
+                            }
+                            Err(_) => {
+                                std::thread::sleep(Duration::from_secs(1));
+                            }
+                        }
+                    }
+                });
             }
         });
     }
