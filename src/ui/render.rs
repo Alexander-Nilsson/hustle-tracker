@@ -324,7 +324,10 @@ pub fn draw(app: &App, f: &mut Frame) {
 
                 // Create display name with window name if available
                 let clean_app = App::clean_app_name(&session.app_name);
-                let display_name = if let Some(window_name) = &session.window_name {
+                let redact = std::env::var("HUSTLE_REDACT").ok().as_deref() == Some("1");
+                let display_name = if redact {
+                    clean_app.clone()
+                } else if let Some(window_name) = &session.window_name {
                     format!("{} ({})", clean_app, window_name)
                 } else {
                     clean_app
