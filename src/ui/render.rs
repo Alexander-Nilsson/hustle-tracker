@@ -787,6 +787,28 @@ pub fn draw_stats(f: &mut Frame, area: Rect, data: &[crate::ui::hierarchical::Hi
         format!("📈 Detailed Stats (Total: {}s{})", total_seconds, metrics_suffix)
     };
 
+    // Project unification: top project by time
+    use std::collections::HashMap;
+    let mut project_durations: HashMap<String, i64> = HashMap::new();
+    for sess in &app.current_history {
+        let proj = sess.terminal_project_name.clone()
+            .or_else(|| sess.ide_project_name.clone())
+            .or_else(|| sess.editor_project_path.clone())
+            .unwrap_or_else(|| "Unknown".to_string());
+        *project_durations.entry(proj).or_insert(0) += sess.duration;
+    }
+    if let Some(sess) = &app.current_session {
+        let proj = sess.terminal_project_name.clone()
+            .or_else(|| sess.ide_project_name.clone())
+            .or_else(|| sess.editor_project_path.clone())
+            .unwrap_or_else(|| "Unknown".to_string());
+        *project_durations.entry(proj).or_insert(0) += sess.duration;
+    }
+    if let Some((proj, dur)) = project_durations.iter().max_by_key(|(_, v)| *v) {
+        let h = dur / 3600; let m = (dur % 3600) / 60;
+        stats_items.push(ListItem::new(Line::from(format!("📁 Top project: {} ({}h {}m)", proj, h, m))));
+    }
+
     let stats_list = List::new(stats_items)
         .block(Block::default().borders(Borders::ALL).title(stats_title));
     f.render_widget(stats_list, area);
