@@ -40,6 +40,11 @@ const MIGRATIONS: &[EmbeddedMigration] = &[
         description: "20251201000000_add_input_metrics.sql",
         sql: include_str!("../../database/migrations/20251201000000_add_input_metrics.sql"),
     },
+    EmbeddedMigration {
+        version: 20251202000000,
+        description: "20251202000000_add_pointer_metrics.sql",
+        sql: include_str!("../../database/migrations/20251202000000_add_pointer_metrics.sql"),
+    },
 ];
 
 pub struct Database {
@@ -247,7 +252,7 @@ impl Database {
                 tmux_window_name, tmux_pane_count, terminal_multiplexer,
                 tmux_window_name_renamed, tmux_window_name_category,
                 ide_project_name, ide_file_open, ide_workspace,
-                parsed_data, parsing_success, is_afk, keystroke_count, backspace_count
+                parsed_data, parsing_success, is_afk, keystroke_count, backspace_count, mouse_click_count, scroll_ticks
             ) VALUES (
                 $1, $2, $3, $4, $5,
                 $6, $7, $8,
@@ -259,7 +264,8 @@ impl Database {
                 $23, $24, $25,
                 $26, $27,
                 $28, $29, $30,
-                $31, $32, $33, $34, $35
+                $31, $32, $33, $34, $35,
+                $36, $37
             ) RETURNING id
             "#,
         )
@@ -306,6 +312,8 @@ impl Database {
         // Input metrics
         .bind(session.keystroke_count)
         .bind(session.backspace_count)
+        .bind(session.mouse_click_count)
+        .bind(session.scroll_ticks)
         .fetch_one(&self.pool)
         .await?;
         Ok(id.0)
@@ -327,8 +335,9 @@ impl Database {
                 tmux_window_name_renamed = $25, tmux_window_name_category = $26,
                 ide_project_name = $27, ide_file_open = $28, ide_workspace = $29,
                 parsed_data = $30, parsing_success = $31, is_afk = $32, is_idle = $33, idle_accumulation_secs = $34,
-                keystroke_count = $35, backspace_count = $36
-            WHERE id = $37
+                keystroke_count = $35, backspace_count = $36,
+                mouse_click_count = $37, scroll_ticks = $38
+            WHERE id = $39
             "#,
         )
         .bind(&session.app_name)
@@ -367,6 +376,8 @@ impl Database {
         .bind(session.idle_accumulation_secs)
         .bind(session.keystroke_count)
         .bind(session.backspace_count)
+        .bind(session.mouse_click_count)
+        .bind(session.scroll_ticks)
         .bind(id)
         .execute(&self.pool)
         .await?;

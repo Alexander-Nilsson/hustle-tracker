@@ -21,6 +21,8 @@ pub struct Daemon {
     last_recorded_idle_secs: i64,
     keystroke_count: Arc<AtomicU64>,
     backspace_count: Arc<AtomicU64>,
+    mouse_click_count: Arc<AtomicU64>,
+    scroll_ticks: Arc<AtomicU64>,
 }
 
 impl Daemon {
@@ -29,9 +31,11 @@ impl Daemon {
         let last_input = Arc::new(Mutex::new(Local::now()));
         let keystroke_count = Arc::new(AtomicU64::new(0));
         let backspace_count = Arc::new(AtomicU64::new(0));
+        let mouse_click_count = Arc::new(AtomicU64::new(0));
+        let scroll_ticks = Arc::new(AtomicU64::new(0));
 
         // Start input monitoring thread
-        Self::start_input_monitoring(Arc::clone(&last_input), Arc::clone(&keystroke_count), Arc::clone(&backspace_count));
+        Self::start_input_monitoring(Arc::clone(&last_input), Arc::clone(&keystroke_count), Arc::clone(&backspace_count), Arc::clone(&mouse_click_count), Arc::clone(&scroll_ticks));
 
         Self {
             database,
@@ -43,6 +47,8 @@ impl Daemon {
             last_recorded_idle_secs: 0,
             keystroke_count,
             backspace_count,
+            mouse_click_count,
+            scroll_ticks,
         }
     }
 
@@ -51,6 +57,8 @@ impl Daemon {
         last_input: Arc<Mutex<DateTime<Local>>>,
         keystroke_count: Arc<AtomicU64>,
         backspace_count: Arc<AtomicU64>,
+        mouse_click_count: Arc<AtomicU64>,
+        scroll_ticks: Arc<AtomicU64>,
     ) {
         std::thread::spawn(move || {
             let callback = move |event: rdev::Event| {
@@ -62,7 +70,15 @@ impl Daemon {
                         }
                         *last_input.lock().unwrap() = Local::now();
                     }
-                    EventType::KeyRelease(_) | EventType::ButtonPress(_) | EventType::ButtonRelease(_) | EventType::MouseMove { .. } => {
+                    EventType::ButtonPress(_) => {
+                        mouse_click_count.fetch_add(1, Ordering::Relaxed);
+                        *last_input.lock().unwrap() = Local::now();
+                    }
+                    EventType::Wheel { delta_x, delta_y } => {
+                        scroll_ticks.fetch_add((delta_x.unsigned_abs() + delta_y.unsigned_abs()) as u64, Ordering::Relaxed);
+                        *last_input.lock().unwrap() = Local::now();
+                    }
+                    EventType::KeyRelease(_) | EventType::ButtonRelease(_) | EventType::MouseMove { .. } => {
                         *last_input.lock().unwrap() = Local::now();
                     }
                     _ => {}
@@ -370,9 +386,13 @@ impl Daemon {
     fn flush_input_metrics(&mut self) {
         let ks = self.keystroke_count.swap(0, Ordering::Relaxed) as i64;
         let bs = self.backspace_count.swap(0, Ordering::Relaxed) as i64;
+        let mc = self.mouse_click_count.swap(0, Ordering::Relaxed) as i64;
+        let sc = self.scroll_ticks.swap(0, Ordering::Relaxed) as i64;
         if let Some(session) = &mut self.current_session {
             session.keystroke_count = Some(session.keystroke_count.unwrap_or(0) + ks);
             session.backspace_count = Some(session.backspace_count.unwrap_or(0) + bs);
+            session.mouse_click_count = Some(session.mouse_click_count.unwrap_or(0) + mc);
+            session.scroll_ticks = Some(session.scroll_ticks.unwrap_or(0) + sc);
         }
     }
 
@@ -463,6 +483,8 @@ impl Daemon {
             idle_accumulation_secs: Some(0),
             keystroke_count: Some(0),
             backspace_count: Some(0),
+            mouse_click_count: Some(0),
+            scroll_ticks: Some(0),
         }
     }
 }

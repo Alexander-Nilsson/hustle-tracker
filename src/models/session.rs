@@ -65,6 +65,8 @@ pub struct Session {
     // Lightweight input metrics (aggregated, not per-key)
     pub keystroke_count: Option<i64>,
     pub backspace_count: Option<i64>,
+    pub mouse_click_count: Option<i64>,
+    pub scroll_ticks: Option<i64>,
 }
 
 

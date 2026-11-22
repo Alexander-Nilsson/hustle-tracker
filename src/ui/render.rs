@@ -769,8 +769,12 @@ pub fn draw_stats(f: &mut Frame, area: Rect, data: &[crate::ui::hierarchical::Hi
         + app.current_session.as_ref().map(|s| s.keystroke_count.unwrap_or(0)).unwrap_or(0);
     let total_backspaces: i64 = app.current_history.iter().map(|s| s.backspace_count.unwrap_or(0)).sum::<i64>()
         + app.current_session.as_ref().map(|s| s.backspace_count.unwrap_or(0)).unwrap_or(0);
+    let total_clicks: i64 = app.current_history.iter().map(|s| s.mouse_click_count.unwrap_or(0)).sum::<i64>()
+        + app.current_session.as_ref().map(|s| s.mouse_click_count.unwrap_or(0)).unwrap_or(0);
+    let total_scroll: i64 = app.current_history.iter().map(|s| s.scroll_ticks.unwrap_or(0)).sum::<i64>()
+        + app.current_session.as_ref().map(|s| s.scroll_ticks.unwrap_or(0)).unwrap_or(0);
 
-    let metrics_suffix = format!(" | Keys: {} (BS: {})", total_keys, total_backspaces);
+    let metrics_suffix = format!(" | Keys: {} (BS: {}) Clicks: {} Scroll: {}", total_keys, total_backspaces, total_clicks, total_scroll);
     let stats_title = if total_hours > 0 {
         format!("📈 Detailed Stats (Total: {}h {}m {}s{})", total_hours, total_minutes, total_seconds, metrics_suffix)
     } else if total_minutes > 0 {
