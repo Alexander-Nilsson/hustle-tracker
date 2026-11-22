@@ -775,7 +775,10 @@ pub fn draw_stats(f: &mut Frame, area: Rect, data: &[crate::ui::hierarchical::Hi
         + app.current_session.as_ref().map(|s| s.scroll_ticks.unwrap_or(0)).unwrap_or(0);
 
     let switches = app.current_history.len() as i64 + if app.current_session.is_some() { 1 } else { 0 };
-    let metrics_suffix = format!(" | Keys: {} (BS: {}) Clicks: {} Scroll: {} Switches: {}", total_keys, total_backspaces, total_clicks, total_scroll, switches);
+    let minutes = (total_duration as f64 / 60.0).max(1.0);
+    let wpm = (total_keys as f64 / 5.0) / minutes;
+    let bs_ratio = if total_keys > 0 { (total_backspaces as f64 / total_keys as f64) * 100.0 } else { 0.0 };
+    let metrics_suffix = format!(" | Keys: {} (BS: {}) Clicks: {} Scroll: {} Switches: {} WPM: {:.0} BS%: {:.1}", total_keys, total_backspaces, total_clicks, total_scroll, switches, wpm, bs_ratio);
     let stats_title = if total_hours > 0 {
         format!("📈 Detailed Stats (Total: {}h {}m {}s{})", total_hours, total_minutes, total_seconds, metrics_suffix)
     } else if total_minutes > 0 {
