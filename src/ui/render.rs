@@ -35,6 +35,7 @@ pub fn draw(app: &App, f: &mut Frame) {
             match action {
                 InputAction::RenameApp { .. } => "Rename Mode - Enter new name for the app".to_string(),
                 InputAction::CreateCategory { .. } => "Category Mode - Enter custom category name (e.g., 🎮 Gaming)".to_string(),
+                InputAction::Search => "Search Mode - Filter by app/window name".to_string(),
             }
         }
         AppState::CommandsPopup => "Commands Menu - Press key to execute or Esc to close".to_string(),
@@ -240,6 +241,7 @@ pub fn draw(app: &App, f: &mut Frame) {
             let title = match action {
                 InputAction::RenameApp { .. } => "✏️  Rename App",
                 InputAction::CreateCategory { .. } => "🏷️  Create Custom Category",
+                InputAction::Search => "🔍 Search",
             };
 
             // Create input text with cursor
@@ -831,6 +833,10 @@ pub fn draw_stats(f: &mut Frame, area: Rect, data: &[crate::ui::hierarchical::Hi
     stats_items.push(ListItem::new(Line::from(format!("🕐 Hours: {}", heat))));
 
     stats_items.push(ListItem::new(Line::from(format!("🎯 Goal: {}/{} min  Streak: {} days", app.today_minutes, app.goal_minutes, app.streak_days))));
+
+    if let Some(q) = &app.search_filter {
+        stats_items.push(ListItem::new(Line::from(format!("🔍 Filter: {}", q))));
+    }
 
     let stats_list = List::new(stats_items)
         .block(Block::default().borders(Borders::ALL).title(stats_title));

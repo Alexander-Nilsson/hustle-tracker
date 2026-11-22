@@ -30,6 +30,7 @@ pub use crate::ui::tracking::ViewMode;
 pub enum InputAction {
     RenameApp { old_name: String },
     CreateCategory { app_name: String },
+    Search,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +62,7 @@ pub struct App {
     pub current_app: String,
     current_window: Option<String>,
     pub current_session: Option<Session>,
+    pub search_filter: Option<String>,
     pub goal_minutes: i64,
     pub today_minutes: i64,
     pub streak_days: i64,
@@ -106,6 +108,7 @@ impl App {
             current_app: "unknown".to_string(),
             current_window: None,
             current_session: None,
+            search_filter: None,
             goal_minutes: 120,
             today_minutes: 0,
             streak_days: 0,
@@ -349,6 +352,7 @@ impl App {
                             KeyCode::Char('a') => self.start_app_selection(),
                             KeyCode::Char('c') => self.start_category_selection(),
                             KeyCode::Char('h') => self.state = AppState::HistoryPopup { view_mode: view_mode.clone(), scroll_position: 0 },
+                            KeyCode::Char('/') => self.state = AppState::Input { prompt: "Search".to_string(), buffer: String::new(), action: InputAction::Search },
                             KeyCode::Char('b') => {
                                 let vm = view_mode.clone();
                                 self.load_breakdown_data_from_history();
@@ -1138,6 +1142,10 @@ AppState::BreakdownDashboard { view_mode, selected_panel, panel_scrolls } => {
             ViewMode::Weekly => self.database.get_weekly_sessions().await.unwrap_or_default(),
             ViewMode::Monthly => self.database.get_monthly_sessions().await.unwrap_or_default(),
         };
+        if let Some(q) = &self.search_filter {
+            let q = q.to_lowercase();
+            self.current_history.retain(|s| s.app_name.to_lowercase().contains(&q) || s.window_name.as_deref().unwrap_or("").to_lowercase().contains(&q));
+        }
 
         // Create hierarchical usage data from sessions using hierarchical module
         self.daily_usage = crate::ui::hierarchical::create_hierarchical_usage(&self.current_history);
@@ -1228,6 +1236,11 @@ AppState::BreakdownDashboard { view_mode, selected_panel, panel_scrolls } => {
                     self.refresh_categories().await?;
                 }
 
+                self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() };
+            }
+            InputAction::Search => {
+                if buffer.trim().is_empty() { self.search_filter = None; } else { self.search_filter = Some(buffer.clone()); }
+                self.refresh_all_data().await?;
                 self.state = AppState::Dashboard { view_mode: self.current_view_mode.clone() };
             }
         }
