@@ -45,6 +45,11 @@ const MIGRATIONS: &[EmbeddedMigration] = &[
         description: "20251202000000_add_pointer_metrics.sql",
         sql: include_str!("../../database/migrations/20251202000000_add_pointer_metrics.sql"),
     },
+    EmbeddedMigration {
+        version: 20251203000000,
+        description: "20251203000000_add_goals.sql",
+        sql: include_str!("../../database/migrations/20251203000000_add_goals.sql"),
+    },
 ];
 
 pub struct Database {

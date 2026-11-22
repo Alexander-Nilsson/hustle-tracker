@@ -61,6 +61,9 @@ pub struct App {
     pub current_app: String,
     current_window: Option<String>,
     pub current_session: Option<Session>,
+    pub goal_minutes: i64,
+    pub today_minutes: i64,
+    pub streak_days: i64,
     pub last_input: Arc<Mutex<DateTime<Local>>>,
     last_recorded_idle_secs: i64,  // Track previous idle to calculate delta for accumulation
     // Breakdown data caches
@@ -103,6 +106,9 @@ impl App {
             current_app: "unknown".to_string(),
             current_window: None,
             current_session: None,
+            goal_minutes: 120,
+            today_minutes: 0,
+            streak_days: 0,
             last_input,
             last_recorded_idle_secs: 0,
             browser_breakdown: vec![],
@@ -1142,6 +1148,19 @@ AppState::BreakdownDashboard { view_mode, selected_panel, panel_scrolls } => {
         self.flat_daily_usage = self.database.get_daily_usage().await?;
 
         self.history = self.database.get_recent_sessions(30).await?;
+        self.goal_minutes = self.database.get_daily_goal_minutes().await.unwrap_or(120);
+        self.today_minutes = self.database.get_today_total_minutes().await.unwrap_or(0);
+        // streak
+        let totals = self.database.get_daily_totals_last_n(30).await.unwrap_or_default();
+        let mut map: std::collections::HashMap<chrono::NaiveDate, i64> = std::collections::HashMap::new();
+        for (d,m) in totals { map.insert(d,m); }
+        let mut streak = 0i64;
+        let mut day = chrono::Local::now().date_naive();
+        loop {
+            if map.get(&day).copied().unwrap_or(0) >= self.goal_minutes { streak += 1; day = day - chrono::Duration::days(1); } else { break; }
+            if streak >= 30 { break; }
+        }
+        self.streak_days = streak;
         Ok(())
     }
 

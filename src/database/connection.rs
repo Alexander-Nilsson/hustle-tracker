@@ -45,6 +45,11 @@ const MIGRATIONS: &[EmbeddedMigration] = &[
         description: "20251202000000_add_pointer_metrics.sql",
         sql: include_str!("migrations/20251202000000_add_pointer_metrics.sql"),
     },
+    EmbeddedMigration {
+        version: 20251203000000,
+        description: "20251203000000_add_goals.sql",
+        sql: include_str!("migrations/20251203000000_add_goals.sql"),
+    },
 ];
 
 /// PostgreSQL connection wrapper with embedded migrations and session CRUD.
@@ -567,6 +572,37 @@ impl Database {
         .await?;
         Ok(rows)
     }
+    pub async fn get_daily_goal_minutes(&self) -> Result<i64> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT target_minutes FROM daily_goals ORDER BY id DESC LIMIT 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(m,)| m).unwrap_or(120))
+    }
+
+    pub async fn get_today_total_minutes(&self) -> Result<i64> {
+        let now = chrono::Local::now();
+        let today_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_local_timezone(chrono::Local).unwrap();
+        let row: (Option<i64>,) = sqlx::query_as(
+            "SELECT COALESCE(SUM(duration),0)::bigint FROM sessions WHERE start_time >= $1 AND is_afk IS NOT TRUE AND is_idle IS NOT TRUE"
+        )
+        .bind(today_start)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0.unwrap_or(0) / 60)
+    }
+
+    pub async fn get_daily_totals_last_n(&self, days: i64) -> Result<Vec<(chrono::NaiveDate, i64)>> {
+        let now = chrono::Local::now();
+        let start = (now.date_naive() - chrono::Duration::days(days - 1)).and_hms_opt(0,0,0).unwrap().and_local_timezone(chrono::Local).unwrap();
+        let rows: Vec<(chrono::NaiveDate, Option<i64>)> = sqlx::query_as(
+            "SELECT (start_time AT TIME ZONE 'local')::date AS d, COALESCE(SUM(duration),0)::bigint FROM sessions WHERE start_time >= $1 AND is_afk IS NOT TRUE AND is_idle IS NOT TRUE GROUP BY d"
+        )
+        .bind(start)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(d,m)| (d, m.unwrap_or(0)/60)).collect())
+    }
+
     pub async fn get_custom_categories(&self) -> Result<Vec<String>> {
         let categories: Vec<(String,)> = sqlx::query_as(
             "SELECT DISTINCT category FROM sessions WHERE category IS NOT NULL AND category NOT IN ($1, $2, $3, $4, $5, $6, $7, $8)"

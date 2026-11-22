@@ -830,6 +830,8 @@ pub fn draw_stats(f: &mut Frame, area: Rect, data: &[crate::ui::hierarchical::Hi
     }).collect();
     stats_items.push(ListItem::new(Line::from(format!("🕐 Hours: {}", heat))));
 
+    stats_items.push(ListItem::new(Line::from(format!("🎯 Goal: {}/{} min  Streak: {} days", app.today_minutes, app.goal_minutes, app.streak_days))));
+
     let stats_list = List::new(stats_items)
         .block(Block::default().borders(Borders::ALL).title(stats_title));
     f.render_widget(stats_list, area);
