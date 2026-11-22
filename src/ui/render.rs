@@ -763,12 +763,20 @@ pub fn draw_stats(f: &mut Frame, area: Rect, data: &[crate::ui::hierarchical::Hi
     let total_hours = total_duration / 3600;
     let total_minutes = (total_duration % 3600) / 60;
     let total_seconds = total_duration % 60;
+
+    // Aggregate lightweight input metrics from history + current session
+    let total_keys: i64 = app.current_history.iter().map(|s| s.keystroke_count.unwrap_or(0)).sum::<i64>()
+        + app.current_session.as_ref().map(|s| s.keystroke_count.unwrap_or(0)).unwrap_or(0);
+    let total_backspaces: i64 = app.current_history.iter().map(|s| s.backspace_count.unwrap_or(0)).sum::<i64>()
+        + app.current_session.as_ref().map(|s| s.backspace_count.unwrap_or(0)).unwrap_or(0);
+
+    let metrics_suffix = format!(" | Keys: {} (BS: {})", total_keys, total_backspaces);
     let stats_title = if total_hours > 0 {
-        format!("📈 Detailed Stats (Total: {}h {}m {}s)", total_hours, total_minutes, total_seconds)
+        format!("📈 Detailed Stats (Total: {}h {}m {}s{})", total_hours, total_minutes, total_seconds, metrics_suffix)
     } else if total_minutes > 0 {
-        format!("📈 Detailed Stats (Total: {}m {}s)", total_minutes, total_seconds)
+        format!("📈 Detailed Stats (Total: {}m {}s{})", total_minutes, total_seconds, metrics_suffix)
     } else {
-        format!("📈 Detailed Stats (Total: {}s)", total_seconds)
+        format!("📈 Detailed Stats (Total: {}s{})", total_seconds, metrics_suffix)
     };
 
     let stats_list = List::new(stats_items)

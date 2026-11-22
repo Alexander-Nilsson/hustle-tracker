@@ -63,6 +63,8 @@ pub async fn create_session_with_parsing_and_afk(db: &Database, app_name: String
         is_afk,
         is_idle: Some(false),  // Default to not idle for new sessions
         idle_accumulation_secs: Some(0),  // Initialize idle accumulation to 0
+        keystroke_count: Some(0),
+        backspace_count: Some(0),
     };
 
     let id = db.insert_session(&session).await?;

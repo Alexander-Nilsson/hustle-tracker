@@ -61,6 +61,10 @@ pub struct Session {
 
     // Accumulated idle time in this session (seconds) - doesn't reset when user returns
     pub idle_accumulation_secs: Option<i64>,
+
+    // Lightweight input metrics (aggregated, not per-key)
+    pub keystroke_count: Option<i64>,
+    pub backspace_count: Option<i64>,
 }
 
 

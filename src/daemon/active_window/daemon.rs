@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Local};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time;
@@ -19,15 +19,19 @@ pub struct Daemon {
     current_session: Option<Session>,
     last_input: Arc<Mutex<DateTime<Local>>>,
     last_recorded_idle_secs: i64,
+    keystroke_count: Arc<AtomicU64>,
+    backspace_count: Arc<AtomicU64>,
 }
 
 impl Daemon {
     pub fn new(database: Database) -> Self {
         let monitor = AppMonitor::new();
         let last_input = Arc::new(Mutex::new(Local::now()));
+        let keystroke_count = Arc::new(AtomicU64::new(0));
+        let backspace_count = Arc::new(AtomicU64::new(0));
 
         // Start input monitoring thread
-        Self::start_input_monitoring(Arc::clone(&last_input));
+        Self::start_input_monitoring(Arc::clone(&last_input), Arc::clone(&keystroke_count), Arc::clone(&backspace_count));
 
         Self {
             database,
@@ -37,16 +41,28 @@ impl Daemon {
             current_session: None,
             last_input,
             last_recorded_idle_secs: 0,
+            keystroke_count,
+            backspace_count,
         }
     }
 
     // Input monitoring using rdev
-    fn start_input_monitoring(last_input: Arc<Mutex<DateTime<Local>>>) {
+    fn start_input_monitoring(
+        last_input: Arc<Mutex<DateTime<Local>>>,
+        keystroke_count: Arc<AtomicU64>,
+        backspace_count: Arc<AtomicU64>,
+    ) {
         std::thread::spawn(move || {
             let callback = move |event: rdev::Event| {
                 match event.event_type {
-                    EventType::KeyPress(_) | EventType::KeyRelease(_) | EventType::ButtonPress(_) | EventType::ButtonRelease(_) | EventType::MouseMove { .. } => {
-                        log::debug!("Input event detected: {:?}", event.event_type);
+                    EventType::KeyPress(key) => {
+                        keystroke_count.fetch_add(1, Ordering::Relaxed);
+                        if key == rdev::Key::Backspace {
+                            backspace_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        *last_input.lock().unwrap() = Local::now();
+                    }
+                    EventType::KeyRelease(_) | EventType::ButtonPress(_) | EventType::ButtonRelease(_) | EventType::MouseMove { .. } => {
                         *last_input.lock().unwrap() = Local::now();
                     }
                     _ => {}
@@ -87,6 +103,7 @@ impl Daemon {
 
             // Check for AFK status and window changes every second
             if last_afk_check.elapsed() >= afk_check_interval {
+                self.flush_input_metrics();
                 // Get current window info to detect activity even if rdev fails (Wayland fallback)
                 let active_info = self.monitor.get_active_window_info_async().await.ok();
 
@@ -217,6 +234,9 @@ impl Daemon {
             }
 
             // Auto save every hour
+            if last_save.elapsed() >= save_interval {
+                self.flush_input_metrics();
+            }
             if last_save.elapsed() >= save_interval
                 && let Some(session) = &mut self.current_session {
                     session.duration = Local::now().signed_duration_since(session.start_time).num_seconds();
@@ -249,6 +269,7 @@ impl Daemon {
         }
 
         // Save current session on exit
+        self.flush_input_metrics();
         if let Some(mut session) = self.current_session.take() {
             session.duration = Local::now().signed_duration_since(session.start_time).num_seconds();
             if let Err(e) = self.database.apply_renames_and_categories(&mut session).await {
@@ -305,6 +326,8 @@ impl Daemon {
     }
 
     async fn switch_app(&mut self, new_app: String, window_name: Option<String>) -> Result<()> {
+        // Flush input metrics into current session before saving
+        self.flush_input_metrics();
         // End current session
         if let Some(mut session) = self.current_session.take() {
             session.duration = Local::now().signed_duration_since(session.start_time).num_seconds();
@@ -342,6 +365,15 @@ impl Daemon {
         self.current_window = window_name;
         log::info!("Switched to: {}", new_app);
         Ok(())
+    }
+
+    fn flush_input_metrics(&mut self) {
+        let ks = self.keystroke_count.swap(0, Ordering::Relaxed) as i64;
+        let bs = self.backspace_count.swap(0, Ordering::Relaxed) as i64;
+        if let Some(session) = &mut self.current_session {
+            session.keystroke_count = Some(session.keystroke_count.unwrap_or(0) + ks);
+            session.backspace_count = Some(session.backspace_count.unwrap_or(0) + bs);
+        }
     }
 
     fn categorize_app(app: &str) -> (&'static str, ()) {
@@ -429,6 +461,8 @@ impl Daemon {
             is_afk: Some(false),
             is_idle: Some(false),
             idle_accumulation_secs: Some(0),
+            keystroke_count: Some(0),
+            backspace_count: Some(0),
         }
     }
 }
