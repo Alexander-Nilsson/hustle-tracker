@@ -338,6 +338,7 @@ impl App {
                         match key.code {
                             KeyCode::Char('q') => should_break = true,
                             KeyCode::Char('r') => self.refresh_all_data().await?,
+                            KeyCode::Char('e') => self.export_history_csv(),
                             KeyCode::Char('l') => self.state = AppState::ViewingLogs,
                             KeyCode::Char('a') => self.start_app_selection(),
                             KeyCode::Char('c') => self.start_category_selection(),
@@ -1108,6 +1109,17 @@ AppState::BreakdownDashboard { view_mode, selected_panel, panel_scrolls } => {
         }
         // Fall back to pattern matching for backward compatibility
         Self::categorize_app(app)
+    }
+
+    pub fn export_history_csv(&self) {
+        let path = "/tmp/hustle-tracker-export.csv";
+        let mut out = String::from("app_name,window_name,start_time,duration,category\n");
+        for s in &self.current_history {
+            out.push_str(&format!("{},{},{},{},{}\n",
+                s.app_name.replace(','," "), s.window_name.clone().unwrap_or_default().replace(','," "), s.start_time, s.duration, s.category.clone().unwrap_or_default()));
+        }
+        let _ = std::fs::write(path, out);
+        log::info!("Exported history to {}", path);
     }
 
     async fn refresh_all_data(&mut self) -> Result<()> {
